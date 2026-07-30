@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "migrate-react-spectrum-v3-to-s2": {
+      "source": "react-spectrum.adobe.com",
+      "sourceType": "well-known",
+      "computedHash": "2921d292aed37e8eabfd12d9c2c1d296f41833d3166264df8f78511c78a1b4aa"
+    },
+    "react-spectrum-s2": {
+      "source": "react-spectrum.adobe.com",
+      "sourceType": "well-known",
+      "computedHash": "24303efeb91b158da69008234fc1397092ae8777e6df3f9bf0dc60ca430298a3"
+    },
+    "spectrum-audit": {
+      "source": "react-spectrum.adobe.com",
+      "sourceType": "well-known",
+      "computedHash": "529475795a5c49387b215a90e1d4f6f5fa7feaf0f18608cfe36c185fc2155c97"
+    }
+  }
+}

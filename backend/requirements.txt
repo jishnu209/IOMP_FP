@@ -1,0 +1,69 @@
+# Backend dependencies for the FastAPI service.
+# The frontend UI has been updated to use React Spectrum and related React tooling via package.json.
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+httpx==0.27.0
+requests==2.32.3
+python-dotenv==1.0.1
+pydantic==2.8.0
+psycopg2-binary==2.9.9
+fastembed==0.8.0
+openpyxl==3.1.5
+python-multipart==0.0.9
+
+# Real tokenizer-based token counting for pre-call history budgeting
+# (agents/config.py's count_tokens/trim_messages_to_budget) — previously only a
+# transitive dep (pulled in by openai/llama-index), never directly imported.
+tiktoken==0.13.0
+
+# ── Learning-agent additions ──────────────────────────────────────────────────
+# LangGraph powers the unified orchestration graph + every per-agent graph.
+# Without it the code still runs (sequential fallback), but installing it enables
+# true graph execution.
+langgraph==0.2.45
+
+# LlamaIndex powers the advanced RAG pipeline (ingestion, node parsing, metadata,
+# vector index + reranking). The shared retriever degrades to fastembed+cosine if
+# these are absent, so they are additive, not required to boot.
+llama-index-core==0.11.20
+llama-index-embeddings-fastembed==0.2.0
+
+# Persistent vector store: LlamaIndex-managed pgvector table in the same Postgres.
+# This is what lets the shared retriever push top-k ANN search into SQL instead of
+# loading the whole corpus into memory per query. Requires the `vector` extension
+# in Postgres (CREATE EXTENSION vector). All optional — the retriever falls back to
+# the in-memory cosine path if any of these (or the extension) are missing.
+llama-index-vector-stores-postgres==0.2.6
+pgvector==0.2.5   # pinned <0.3 to satisfy llama-index-vector-stores-postgres 0.2.6
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.29.0   # pinned <0.30 to satisfy llama-index-vector-stores-postgres 0.2.6
+
+# PDF ingestion (text + page metadata) for advanced RAG.
+pypdf==5.1.0
+
+# Optional hybrid retrieval (BM25 lexical + vector) — used when present.
+rank-bm25==0.2.2
+
+# ── RAGAS evaluation (evaluation/ragas_eval.py) ─────────────────────────────────
+# Scores every RAG-grounded agent response (main RAG agent + Curriculum/Capstone/
+# Practice/Study Aid's retrieval tools) on faithfulness/answer_relevancy/
+# context_precision. Runs fire-and-forget in a background thread — never on the
+# user-facing request path.
+#
+# Pinned to the 0.1.x series DELIBERATELY, not the latest release: ragas>=0.2
+# depends on langgraph>=1.2 and langchain-core>=1.5, which would force-upgrade
+# the langgraph==0.2.45 every agent's StateGraph is built against — a breaking
+# major-version jump across the whole agent system just for an evaluation
+# dependency. 0.1.21 only needs langchain-core>=0.2.43 (within langgraph
+# 0.2.45's own supported range, >=0.2.43,<0.4.0), so it installs additively.
+# Verified live: all 6 agent graphs still compile and agent calls still succeed
+# after installing this pin.
+ragas==0.1.21
+langchain-core==0.2.43
+langchain==0.2.17
+langchain-community==0.2.19
+langchain-openai==0.1.25
+openai==1.109.1
+datasets==5.0.1
+pandas==3.0.5
