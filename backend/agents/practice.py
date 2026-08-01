@@ -27,7 +27,7 @@ from .config import (
     PRODUCT_DISTINCTIONS, TESTOUT_PASS_THRESHOLD, QUIZ_QUESTION_COUNT,
     WEIGHT_MARKET, WEIGHT_TEAM, WEIGHT_ROLE, call_with_tools,
 )
-from evaluation import evaluate_and_log, extract_tool_contexts
+from evaluation import evaluate_and_log, extract_tool_contexts, summarize_for_ragas
 
 import os
 import json
@@ -268,7 +268,7 @@ def node_generate_scenario(state: dict) -> dict:
         contexts += extract_tool_contexts(resp.get("tool_calls", []), {"search_docs"})
         if contexts:
             try:
-                evaluate_and_log("practice", topic, json.dumps(result), contexts)
+                evaluate_and_log("practice", topic, summarize_for_ragas(result), contexts)
             except Exception:
                 pass
 

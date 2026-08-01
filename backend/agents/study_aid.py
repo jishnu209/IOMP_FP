@@ -43,7 +43,7 @@ from .config import (
     llm_call, get_db_conn, PRODUCT_DISTINCTIONS, call_with_tools,
 )
 from .reasoning import get_track_label
-from evaluation import evaluate_and_log, extract_tool_contexts
+from evaluation import evaluate_and_log, extract_tool_contexts, summarize_for_ragas
 
 import os
 import re
@@ -303,7 +303,7 @@ def node_generate(state: dict) -> dict:
             contexts = extract_tool_contexts(getattr(_tool_call, "_last_tool_calls", []), {"search_docs"})
         if contexts:
             try:
-                evaluate_and_log("study_aid", f"flashcards for {module}", content, contexts)
+                evaluate_and_log("study_aid", f"flashcards for {module}", summarize_for_ragas(content), contexts)
             except Exception:
                 pass
 

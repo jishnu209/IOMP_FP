@@ -374,6 +374,40 @@ def extract_tool_contexts(tool_calls: list, tool_names: set) -> list:
     return contexts
 
 
+def summarize_for_ragas(obj) -> str:
+    """Flatten a structured agent result (dict/list, or a JSON string of one)
+    into prose so ragas's faithfulness metric has real sentences to work with.
+
+    Faithfulness sentence-segments the "answer" (via pysbd) before decomposing
+    it into atomic statements to verify against context. Passing a raw JSON
+    blob straight through — as capstone.py/practice.py/study_aid.py used to —
+    doesn't segment into meaningful sentences, so ragas silently logs
+    "No statements were generated from the answer." and faithfulness comes
+    back None on EVERY call, consistently, regardless of grounding quality.
+    (Confirmed by direct reproduction: identical contexts scored fine for
+    answer_relevancy/context_utilization but always None for faithfulness
+    when the answer was JSON.) This walks the structure and joins every
+    string value into simple period-terminated "sentences" instead."""
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except (TypeError, ValueError):
+            return obj  # already plain text, not JSON — use as-is
+    parts = []
+    def _walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                _walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                _walk(v)
+        elif isinstance(x, str) and x.strip():
+            s = x.strip()
+            parts.append(s if s.endswith((".", "!", "?")) else s + ".")
+    _walk(obj)
+    return " ".join(parts)
+
+
 def get_evaluation_summary() -> dict:
     """Per-agent average scores + sample count — for the Admin AI Safety
     summary cards. Returns {} if the table doesn't exist yet (no evals run).

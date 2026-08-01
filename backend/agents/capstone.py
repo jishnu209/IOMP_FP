@@ -26,7 +26,7 @@ from .config import (
     groq_call, anthropic_call, llm_call, get_db_url, make_meta,
     parse_json_lenient, PRODUCT_DISTINCTIONS, call_with_tools, run_with_timeout,
 )
-from evaluation import evaluate_and_log, extract_tool_contexts
+from evaluation import evaluate_and_log, extract_tool_contexts, summarize_for_ragas
 
 import os
 import json
@@ -430,7 +430,7 @@ def node_generate(state: dict) -> dict:
         contexts = extract_tool_contexts(resp.get("tool_calls", []), {"search_docs"})
         if contexts:
             try:
-                evaluate_and_log("capstone", user, resp["content"], contexts)
+                evaluate_and_log("capstone", user, summarize_for_ragas(result), contexts)
             except Exception:
                 pass
 
