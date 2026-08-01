@@ -170,9 +170,9 @@ def _study_aid_tool_executor():
                 conn = get_db_conn()
                 with conn.cursor() as c:
                     c.execute(
-                        """SELECT content FROM doc_embeddings
-                           WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
-                           ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', %s)) DESC
+                        """SELECT chunk_text FROM doc_embeddings
+                           WHERE to_tsvector('english', chunk_text) @@ plainto_tsquery('english', %s)
+                           ORDER BY ts_rank(to_tsvector('english', chunk_text), plainto_tsquery('english', %s)) DESC
                            LIMIT 3""",
                         (query, query))
                     rows = [r[0][:500] for r in c.fetchall()]

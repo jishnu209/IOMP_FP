@@ -118,9 +118,9 @@ def node_retrieve_content(state: dict) -> dict:
         conn   = psycopg2.connect(get_db_url())
         with conn.cursor() as c:
             c.execute(
-                """SELECT content FROM doc_embeddings
-                   WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
-                   ORDER BY ts_rank(to_tsvector('english', content),
+                """SELECT chunk_text FROM doc_embeddings
+                   WHERE to_tsvector('english', chunk_text) @@ plainto_tsquery('english', %s)
+                   ORDER BY ts_rank(to_tsvector('english', chunk_text),
                             plainto_tsquery('english', %s)) DESC
                    LIMIT 4""",
                 (module_title, module_title),
@@ -196,9 +196,9 @@ def _practice_tool_executor():
                 conn = psycopg2.connect(get_db_url())
                 with conn.cursor() as c:
                     c.execute(
-                        """SELECT content FROM doc_embeddings
-                           WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
-                           ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', %s)) DESC
+                        """SELECT chunk_text FROM doc_embeddings
+                           WHERE to_tsvector('english', chunk_text) @@ plainto_tsquery('english', %s)
+                           ORDER BY ts_rank(to_tsvector('english', chunk_text), plainto_tsquery('english', %s)) DESC
                            LIMIT 3""",
                         (query, query))
                     rows = [r[0][:500] for r in c.fetchall()]
@@ -414,9 +414,9 @@ def _validate_retrieve_context(topic: str) -> list:
         conn = psycopg2.connect(get_db_url())
         with conn.cursor() as c:
             c.execute(
-                """SELECT content FROM doc_embeddings
-                   WHERE to_tsvector('english', content) @@ plainto_tsquery('english', %s)
-                   ORDER BY ts_rank(to_tsvector('english', content),
+                """SELECT chunk_text FROM doc_embeddings
+                   WHERE to_tsvector('english', chunk_text) @@ plainto_tsquery('english', %s)
+                   ORDER BY ts_rank(to_tsvector('english', chunk_text),
                             plainto_tsquery('english', %s)) DESC
                    LIMIT 4""",
                 (topic, topic),

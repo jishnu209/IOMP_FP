@@ -45,6 +45,7 @@ from .config import (
 # load lazily); if the packages/extension are missing, is_available() is False and
 # we transparently use the legacy in-memory path below.
 from . import vector_store as _vstore
+from guardrails import check_output
 
 import re
 import time
@@ -699,7 +700,18 @@ def step_guard(state: dict) -> dict:
         final = (answer + "\n\n⚠️ Note: some claims could not be fully verified "
                  "against the retrieved documentation. Please cross-check the "
                  "official AEP docs.")
-    return {**state, "answer": final, "grounded": grounded, "guard_result": result}
+
+    # check_output is a fast, deterministic safety net distinct from the LLM
+    # groundedness check above: it catches structural problems (empty/too-short
+    # answers, a refusal with no citations, missing citation markers even when
+    # nominally "grounded") that a hallucination-focused judge wouldn't flag on
+    # its own. Previously defined but never wired into any agent — every
+    # response skipped this check entirely.
+    verdict = check_output(final, agent="rag", expect_citations=True, grounded=grounded)
+    final = verdict["answer"]
+
+    return {**state, "answer": final, "grounded": grounded, "guard_result": result,
+            "output_guardrail": {"ok": verdict["ok"], "issues": verdict["issues"], "action": verdict["action"]}}
 
 
 def build_rag_graph():
@@ -743,7 +755,7 @@ def run_rag(query: str, track: str = None, module_title: str = None, graph=None)
         state = step_guard(state)
         final = state
 
-    # RAGAS scoring (faithfulness/answer_relevancy/context_precision) — fire-
+    # RAGAS scoring (faithfulness/answer_relevancy/context_utilization) — fire-
     # and-forget, never blocks or affects this response. Only meaningful when
     # something was actually retrieved; skip entirely on an empty/ungrounded run.
     reranked = final.get("reranked_docs") or final.get("retrieved_docs") or []
@@ -774,5 +786,6 @@ def run_rag(query: str, track: str = None, module_title: str = None, graph=None)
             "docs_retrieved":    len(final.get("retrieved_docs", [])),
             "docs_after_rerank": len(final.get("reranked_docs", [])),
             "grounded":          final.get("grounded", True),
+            "output_guardrail":  final.get("output_guardrail", {}),
         },
     }

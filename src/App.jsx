@@ -684,26 +684,15 @@ function KnowledgeBase({groqKey,track="rtcdp"}){
     if(!qr.trim())return;
     setSearching(true);setAiAnswer(null);setResults([]);
     try{
-      // RAG search
-      const r=await fetch(`${BACKEND}/api/rag`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({query:qr,module:"",track})});
+      // Real RAG agent: retrieve -> rerank -> generate, server-side (this is
+      // also the one path RAGAS scores — see /api/agents/rag -> agents/rag.py
+      // run_rag() -> evaluate_and_log("rag", ...)).
+      const r=await fetch(`${BACKEND}/api/agents/rag`,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({messages:[{role:"user",content:qr}],track,extra:{query:qr}})});
       const d=await r.json();
-      const docs=d?.docs||[];
-      setResults(docs);
-      // AI synthesis answer
-      if(groqKey){
-        const ctx=docs.slice(0,3).map(doc=>`${doc.title||""}:\n${doc.content||doc.excerpt||""}`).join("\n\n");
-        const productName=TRACK_LABELS[track]||"Adobe Experience Platform";
-        const sys=`You are an expert on ${productName} and the broader Adobe Experience Cloud.
-Answer the user's question clearly and directly.
-Use the provided documentation context if relevant. Be concise (under 120 words).
-Reference specific ${productName} features, UI elements, and concepts by their correct names.
-CRITICAL: ${productName} is distinct from other Adobe products — do not conflate AJO with Analytics, or CJA with Adobe Analytics, or WebSDK with Analytics.`;
-        const ans=await callAgent(
-          [{role:"user",content:`Question: ${qr}\n\nContext from docs:\n${ctx||"No docs found."}`}],
-          sys,groqKey,{agentName:"DocSearch",logFn:null,maxTokens:250});
-        setAiAnswer(ans);
-      }
+      const citations=(d?.citations||[]).map(c=>({title:c.title,url:c.url,content:c.excerpt}));
+      setResults(citations);
+      setAiAnswer(d?.answer||null);
     }catch(e){}
     setSearching(false);
   };
@@ -740,7 +729,6 @@ CRITICAL: ${productName} is distinct from other Adobe products — do not confla
         <div style={{background:ACCBG,border:`1px solid ${ACCENT}25`,borderRadius:12,padding:"16px 20px",marginBottom:20}}>
           <div style={{fontSize:11,fontWeight:700,color:ACCTX,letterSpacing:.5,textTransform:"uppercase",marginBottom:8,display:"flex",alignItems:"center",gap:6}}><Ic as={MagicWand} size={13} color={ACCTX}/> AI Answer</div>
           <div style={{fontSize:13.5,color:P.txt,lineHeight:1.75}}>{aiAnswer}</div>
-          {!groqKey&&<div style={{fontSize:11.5,color:P.muted,marginTop:8}}>Add Groq key in Admin → Integrations for AI answers.</div>}
         </div>
       )}
 
@@ -935,6 +923,21 @@ const Ic=({as:C,size=16,color,style={}})=><C UNSAFE_style={{width:size,height:si
 const DEFAULT_AVATAR="https://i.imgur.com/kJOwAdv.png";
 const IMG_AVATARS={exp:"https://i.pravatar.cc/160?img=12",nj2:"https://i.pravatar.cc/160?img=5",mgr:"https://i.pravatar.cc/160?img=33",admin:"https://i.pravatar.cc/160?img=48"};
 const avatarSrc=(persona)=>IMG_AVATARS[persona]||DEFAULT_AVATAR;
+// A real user's chosen emoji+color always wins over the generic persona stock
+// photo — this is the one place that decides what "your avatar" looks like,
+// used everywhere (header, profile page, sidebar) so a saved change shows up
+// consistently instead of some spots reverting to the stock photo.
+function UserAvatarCircle({emoji,color,persona,alt,size=32}){
+  if(emoji) return(
+    <div style={{width:size,height:size,borderRadius:"50%",flexShrink:0,
+      background:color?`linear-gradient(135deg,${color},${color}bb)`:P.blue,
+      display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",
+      fontWeight:500,fontSize:Math.round(size*0.45),lineHeight:1}}>
+      {emoji}
+    </div>
+  );
+  return <Avatar src={avatarSrc(persona)} alt={alt} size={size}/>;
+}
 
 // ── Global styles ─────────────────────────────────────────────────────────────
 const GlobalStyles=()=>{
@@ -1048,13 +1051,11 @@ const TELEMETRY = {
 // Was entirely fictional demo data (TEAM/MEMBER_CERTS/ALL_PROJECTS/INIT_ISSUES)
 // while the UI claimed "live data from Adobe IMS" — now built from the manager's
 // actual registered team (dbMembers), real progress/points/at-risk aggregates
-// (liveSummary, from /api/team/live-summary), and real persisted skill
-// assessments (teamSkills, from /api/skills/team) — the same data already
-// powering Team Overview on this same dashboard.
-// Project/issue context still uses memberProjects (client-side demo state,
-// separate from the real Project Board's own /api/projects fetch) — flagged
-// as a known remaining gap rather than silently left mismatched.
-function buildManagerContext(memberProjects,dbMembers,liveSummary,teamSkills){
+// (liveSummary, from /api/team/live-summary), real persisted skill assessments
+// (teamSkills, from /api/skills/team), and real imported project data
+// (teamProjects, from /api/projects/tracker-table) — every field here comes
+// from a live backend fetch, nothing hardcoded or sample.
+function buildManagerContext(dbMembers,liveSummary,teamSkills,teamProjects){
   const members=dbMembers||[];
   const summaryByName=Object.fromEntries((liveSummary?.members||[]).map(m=>[m.name,m]));
   const skillsByName={};
@@ -1068,24 +1069,66 @@ function buildManagerContext(memberProjects,dbMembers,liveSummary,teamSkills){
 
   const skillLines=Object.entries(skillsByName).map(([n,s])=>`  • ${n}: ${s.join(", ")}`).join("\n")||"  No skill assessments taken yet.";
 
-  const mp=memberProjects||DEFAULT_MEMBER_PROJECTS;
-  const projLines=ALL_PROJECTS.map(p=>{
-    const named=members.map(m=>m.name).filter(n=>mp[n]?.includes(p.code)).join(", ");
-    const open=(INIT_ISSUES[p.code]||[]).filter(i=>i.status!=="Done");
-    return `  • ${p.sector||p.code} — ${p.title} [${p.status}, ${p.sprint}]\n    Team: ${named||"—"}\n    Open issues: ${open.length?open.map(i=>`[${i.priority}] ${i.title}`).join("; "):"None"}`;
-  }).join("\n");
+  const projRows=teamProjects||[];
+  const projLines=projRows.length?projRows.map(p=>
+    `  • ${p.title||p.project_code||"Untitled"} — ${p.member_name||"unassigned"} [${p.health_status||p.status||"—"}, ${p.hrs_per_week||0}h/wk${p.phase?`, ${p.phase}`:""}]`+
+    (p.weekly_comments?`\n    Latest note: ${p.weekly_comments}`:"")
+  ).join("\n"):"  No projects imported yet (Admin → Tracker Import).";
   const atRiskNames=liveSummary?.at_risk_names||[];
-  const blocked=ALL_PROJECTS.filter(p=>p.status==="Blocked");
-  return`\n\n--- Team data (from your registered directory + real module/points/skill records) ---\n\nTEAM STATUS:\n${teamLines}\n\nSKILL ASSESSMENTS:\n${skillLines}\n\nAT-RISK FLAGS:\n${atRiskNames.length?atRiskNames.map(n=>`  • ${n}`).join("\n"):"  None currently"}\n\n--- Project data (demo/sample — not yet wired to the live Project Board) ---\nCLIENT PROJECTS:\n${projLines}\n\nBLOCKED PROJECTS:\n${blocked.length?blocked.map(p=>`  • ${p.sector||p.code} — ${p.title}`).join("\n"):"  None currently"}`;
+  const blocked=projRows.filter(p=>(p.health_status||p.status||"").toLowerCase().match(/blocked|at risk/));
+  const renewalsDue=projRows.filter(p=>(p.renewal||"").toLowerCase()==="yes"||(p.days_remaining!=null&&p.days_remaining<=30));
+  return`\n\n--- Team data (from your registered directory + real module/points/skill records) ---\n\nTEAM STATUS:\n${teamLines}\n\nSKILL ASSESSMENTS:\n${skillLines}\n\nAT-RISK FLAGS:\n${atRiskNames.length?atRiskNames.map(n=>`  • ${n}`).join("\n"):"  None currently"}\n\n--- Project data (from the imported tracker — real, current) ---\nCLIENT PROJECTS (${projRows.length}):\n${projLines}\n\nBLOCKED / AT-RISK PROJECTS:\n${blocked.length?blocked.map(p=>`  • ${p.title} — ${p.member_name} (${p.health_status||p.status})`).join("\n"):"  None currently"}\n\nRENEWALS / DEADLINES WITHIN 30 DAYS:\n${renewalsDue.length?renewalsDue.map(p=>`  • ${p.title} — ${p.member_name}${p.days_remaining!=null?` (${p.days_remaining}d left)`:""}${p.renewal?.toLowerCase()==="yes"?" [renewal]":""}`).join("\n"):"  None currently"}`;
 }
 
-// ── Manager Intelligence Agent ────────────────────────────────────────────────
-function ManagerAgent({profile,groqKey,onLog,memberProjects,dbMembers,liveSummary,teamSkills}){
+// ── ChatMarkdown — lightweight, safe markdown-to-JSX for chat bubbles
+// (**bold**, *italic*, `code`, "- " bullet lists). Builds real React elements
+// instead of dangerouslySetInnerHTML, since this renders live LLM output —
+// no raw HTML injection risk. Deliberately much smaller than the full lesson
+// -content renderer (renderAdobeMarkdown), which is built for whole documents
+// (headings, images, AdobeDocs metadata) and would be the wrong tool here.
+function _inlineMdToNodes(text,keyPrefix){
+  const nodes=[];
+  const re=/\*\*\*([^*]+)\*\*\*|\*\*([^*]+)\*\*|`([^`]+)`|\*([^*\n]+)\*/g;
+  let last=0,m,i=0;
+  while((m=re.exec(text))){
+    if(m.index>last)nodes.push(text.slice(last,m.index));
+    if(m[1]!==undefined)nodes.push(<strong key={`${keyPrefix}-${i++}`}><em>{m[1]}</em></strong>);
+    else if(m[2]!==undefined)nodes.push(<strong key={`${keyPrefix}-${i++}`}>{m[2]}</strong>);
+    else if(m[3]!==undefined)nodes.push(<code key={`${keyPrefix}-${i++}`} style={{background:P.surface,padding:"1px 5px",borderRadius:4,fontSize:"0.92em"}}>{m[3]}</code>);
+    else if(m[4]!==undefined)nodes.push(<em key={`${keyPrefix}-${i++}`}>{m[4]}</em>);
+    last=re.lastIndex;
+  }
+  if(last<text.length)nodes.push(text.slice(last));
+  return nodes;
+}
+function ChatMarkdown({text}){
+  const lines=(text||"").split("\n");
+  const blocks=[];
+  let list=[];
+  const flushList=(key)=>{
+    if(list.length){ blocks.push(<ul key={`ul-${key}`} style={{margin:"4px 0",paddingLeft:18}}>{list}</ul>); list=[]; }
+  };
+  lines.forEach((line,idx)=>{
+    const bullet=line.match(/^\s*[-•]\s+(.*)$/);
+    if(bullet){
+      list.push(<li key={`li-${idx}`} style={{marginBottom:2}}>{_inlineMdToNodes(bullet[1],`li${idx}`)}</li>);
+    } else {
+      flushList(idx);
+      if(line.trim()==="")blocks.push(<div key={`br-${idx}`} style={{height:6}}/>);
+      else blocks.push(<div key={`p-${idx}`}>{_inlineMdToNodes(line,`p${idx}`)}</div>);
+    }
+  });
+  flushList("end");
+  return <>{blocks}</>;
+}
+
+// ── Team Intel Agent — plain LLM call grounded entirely in live backend data ──
+function ManagerAgent({profile,groqKey,onLog,dbMembers,liveSummary,teamSkills,teamProjects}){
   const p=profile||PROFILES.mgr;
-  const [msgs,setMsgs]=useState([{role:"assistant",content:`Hi ${p.displayName||p.name}. I have your registered team's real progress, points, and skill assessments, plus sample project/issue data. What would you like to know?`}]);
+  const [msgs,setMsgs]=useState([{role:"assistant",content:`Hi ${p.displayName||p.name}. I have your registered team's real progress, points, skill assessments, and imported project data. What would you like to know?`}]);
   const [input,setInput]=useState(""),[busy,setBusy]=useState(false);
   const ref=useRef(null);
-  const suggestions=["Who is at risk right now?","What's blocked across projects?","Who has the most modules completed?","Which team members have taken a skill assessment?","Which projects are going live soon?","What are the open issues on APAC-ONBOARD?"];
+  const suggestions=["Who is at risk right now?","Which projects are blocked or at risk?","Who has the most modules completed?","Which team members have taken a skill assessment?","Any renewals or deadlines coming up in the next 30 days?","What's everyone's current hrs/week across projects?"];
   useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[msgs]);
 
   const send=async(text)=>{
@@ -1094,7 +1137,7 @@ function ManagerAgent({profile,groqKey,onLog,memberProjects,dbMembers,liveSummar
     const nm={role:"user",content:msg},next=[...msgs,nm];
     setMsgs(next);setInput("");setBusy(true);
     try{
-      const sys=AGENT_CONFIGS.managerIntel.sys+buildManagerContext(memberProjects,dbMembers,liveSummary,teamSkills);
+      const sys=AGENT_CONFIGS.managerIntel.sys+buildManagerContext(dbMembers,liveSummary,teamSkills,teamProjects);
       const r=await callAgent(next.map(m=>({role:m.role,content:m.content})),sys,groqKey,{agentName:"ManagerIntel",logFn:onLog,maxTokens:400});
       setMsgs(prev=>[...prev,{role:"assistant",content:r}]);
     }catch(e){setMsgs(prev=>[...prev,{role:"assistant",content:`Error: ${e.message}`}]);}
@@ -1103,14 +1146,20 @@ function ManagerAgent({profile,groqKey,onLog,memberProjects,dbMembers,liveSummar
 
   return(<div style={{display:"flex",flexDirection:"column",height:"100%"}}>
     <div style={{padding:"7px 14px",background:P.amberBg,borderBottom:`1px solid ${P.amber}30`,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
-      <span style={{fontSize:11.5,color:P.amber,fontWeight:600}}>🧭 Team Intelligence · real team data + sample project data</span>
+      <span style={{fontSize:11.5,color:P.amber,fontWeight:600}}>🧭 Team Intelligence · real team + project data</span>
       <span style={{fontSize:11,color:groqKey?P.grn:P.dim}}>{groqKey?"🟢 Groq":"Claude Sonnet"}</span>
     </div>
-    {msgs.length===1&&<div style={{padding:"12px 16px",flexShrink:0}}>
-      <div style={{fontSize:11.5,fontWeight:600,color:P.muted,marginBottom:8}}>Suggested queries</div>
-      <div style={{display:"flex",flexWrap:"wrap",gap:7}}>
+    {msgs.length===1&&<div style={{padding:"14px 16px",flexShrink:0}}>
+      <div style={{fontSize:11.5,fontWeight:600,color:P.muted,marginBottom:9}}>💡 Try asking</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
         {suggestions.map(s=>(
-          <button key={s} onClick={()=>send(s)} style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:20,padding:"5px 12px",fontSize:12,cursor:"pointer",color:P.txt}}>{s}</button>
+          <button key={s} onClick={()=>send(s)}
+            style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:20,padding:"6px 14px",fontSize:12.5,
+              cursor:"pointer",color:P.txt,fontFamily:"inherit",transition:"background .15s, border-color .15s"}}
+            onMouseEnter={e=>{e.currentTarget.style.background=P.amberBg;e.currentTarget.style.borderColor=P.amber+"50";}}
+            onMouseLeave={e=>{e.currentTarget.style.background=P.panel;e.currentTarget.style.borderColor=P.border;}}>
+            {s}
+          </button>
         ))}
       </div>
     </div>}
@@ -1118,7 +1167,9 @@ function ManagerAgent({profile,groqKey,onLog,memberProjects,dbMembers,liveSummar
       {msgs.map((m,i)=>(
         <div key={i} style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",gap:8,alignItems:"flex-end"}}>
           {m.role==="assistant"&&<div style={{width:28,height:28,borderRadius:"50%",background:`linear-gradient(135deg,${P.amber},#c96d00)`,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:11,fontWeight:500,flexShrink:0}}>🧭</div>}
-          <div style={{maxWidth:"80%",padding:"10px 14px",borderRadius:m.role==="user"?"10px 10px 3px 10px":"10px 10px 10px 3px",background:m.role==="user"?`linear-gradient(135deg,${P.amber},#c96d00)`:P.panel,color:m.role==="user"?"#fff":P.txt,border:m.role==="assistant"?`1px solid ${P.border}`:"none",fontSize:13,lineHeight:1.7,whiteSpace:"pre-line"}}>{m.content}</div>
+          <div style={{maxWidth:"80%",padding:"10px 14px",borderRadius:m.role==="user"?"10px 10px 3px 10px":"10px 10px 10px 3px",background:m.role==="user"?`linear-gradient(135deg,${P.amber},#c96d00)`:P.panel,color:m.role==="user"?"#fff":P.txt,border:m.role==="assistant"?`1px solid ${P.border}`:"none",fontSize:13,lineHeight:1.7}}>
+            {m.role==="assistant"?<ChatMarkdown text={m.content}/>:<span style={{whiteSpace:"pre-line"}}>{m.content}</span>}
+          </div>
         </div>
       ))}
       {busy&&<div style={{display:"flex",gap:8,alignItems:"flex-end"}}><div style={{width:28,height:28,borderRadius:"50%",background:`linear-gradient(135deg,${P.amber},#c96d00)`,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:11}}>🧭</div><div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:"10px 10px 10px 3px",padding:"9px 14px",fontSize:13,color:P.muted}}><span style={{letterSpacing:3}}>···</span></div></div>}
@@ -1132,7 +1183,7 @@ function ManagerAgent({profile,groqKey,onLog,memberProjects,dbMembers,liveSummar
 
 
 // ── Nav + Tabs ────────────────────────────────────────────────────────────────
-function Nav({initial,name,sub,color,badge,onLogout,progress,onToggleTheme,avatarEmoji,persona}){
+function Nav({initial,name,sub,color,badge,onLogout,progress,onToggleTheme,avatarEmoji,persona,onGoToProfile}){
   const isDark=getThemeMode()==="dark";
   const [menuOpen,setMenuOpen]=useState(false);
   return(<nav style={{background:P.panel,borderBottom:`1px solid ${P.border}`,padding:"0 24px",display:"flex",alignItems:"center",height:54,gap:14,flexShrink:0,position:"relative",zIndex:10}}>
@@ -1158,13 +1209,13 @@ function Nav({initial,name,sub,color,badge,onLogout,progress,onToggleTheme,avata
           <div style={{fontSize:13,fontWeight:600,color:isDark?"#fff":P.txt,lineHeight:1.2,letterSpacing:-.2}}>{name}</div>
           <div style={{fontSize:10.5,color:isDark?"rgba(255,255,255,.7)":P.dim,lineHeight:1.3}}>{sub}</div>
         </div>
-        <Avatar src={avatarSrc(persona)} alt={name} size={32}/>
+        <UserAvatarCircle emoji={avatarEmoji} color={color} persona={persona} alt={name} size={32}/>
       </button>
       {menuOpen&&<>
         <div style={{position:"fixed",inset:0,zIndex:40}} onClick={()=>setMenuOpen(false)}/>
         <div role="menu" style={{position:"absolute",top:46,right:0,width:270,background:P.panel,border:`1px solid ${P.border}`,borderRadius:14,boxShadow:P.shadowHv,zIndex:50,padding:"14px 14px 8px",overflow:"hidden"}}>
           <div style={{display:"flex",alignItems:"center",gap:11,marginBottom:12}}>
-            <Avatar src={avatarSrc(persona)} alt={name} size={44}/>
+            <UserAvatarCircle emoji={avatarEmoji} color={color} persona={persona} alt={name} size={44}/>
             <div style={{minWidth:0}}>
               <div style={{fontSize:14,fontWeight:600,color:isDark?"#fff":P.txt,lineHeight:1.2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{name}</div>
               <div style={{fontSize:11.5,color:isDark?"rgba(255,255,255,.75)":P.muted,lineHeight:1.3}}>{sub}</div>
@@ -1174,6 +1225,12 @@ function Nav({initial,name,sub,color,badge,onLogout,progress,onToggleTheme,avata
             <Switch isSelected={isDark} onChange={()=>onToggleTheme?.()} staticColor={isDark?"white":undefined}>{isDark?"Dark theme":"Light theme"}</Switch>
           </div>
           <div style={{height:1,background:P.border,margin:"0 -14px 6px"}}/>
+          {onGoToProfile&&<button role="menuitem" onClick={()=>{setMenuOpen(false);onGoToProfile();}}
+            onMouseEnter={e=>e.currentTarget.style.background=P.hovGrey}
+            onMouseLeave={e=>e.currentTarget.style.background="transparent"}
+            style={{display:"flex",alignItems:"center",gap:10,width:"100%",background:"transparent",border:"none",borderRadius:8,padding:"9px 10px",fontSize:13.5,color:isDark?"#fff":P.txt,cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+            Profile
+          </button>}
           <button role="menuitem" onClick={()=>{setMenuOpen(false);onLogout?.();}}
             onMouseEnter={e=>e.currentTarget.style.background=P.hovGrey}
             onMouseLeave={e=>e.currentTarget.style.background="transparent"}
@@ -1252,7 +1309,7 @@ function Sidebar({items,active,onChange,profile,onLogout,onToggleTheme,progress,
       {/* User section */}
       <div style={{padding:"12px 14px",borderTop:`1px solid ${P.border}`,flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:10}}>
-          <div style={{width:32,height:32,borderRadius:"50%",background:profile?.color||P.blue,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:500,fontSize:13,flexShrink:0}}>{profile?.initial||"?"}</div>
+          <UserAvatarCircle emoji={profile?.avatar_emoji} color={profile?.avatar_color||profile?.color} persona={profile?.persona} alt={profile?.name||"?"} size={32}/>
           <div style={{flex:1,minWidth:0}}>
             <div style={{fontSize:12.5,fontWeight:600,color:P.txt,letterSpacing:-.1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{profile?.name}</div>
             <div style={{fontSize:10.5,color:P.dim,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{profile?.tenure}</div>
@@ -1418,7 +1475,7 @@ function MyPointsWidget({profile:p,modulesDone,capstoneCompleted,refreshKey=0}){
 }
 
 // ── Profile settings — avatar, username, password change. Real accounts only ──
-function ProfileSettingsCard({email,accountType,currentUsername,currentEmoji,currentColor,fallbackColor}){
+function ProfileSettingsCard({email,accountType,currentUsername,currentEmoji,currentColor,fallbackColor,onSaved}){
   const [open,setOpen]=useState(false);
   const [emojis,setEmojis]=useState(["🦊","🐼","🚀","🎯","⚡","🌟","🔥","💡","🎨","🧠","🦉","🐙","🌈","🍀","🎮","🛰️","🧩","🦋","🐢","🦄"]);
   const [colors,setColors]=useState(["#1473E6","#E34850","#12805C","#B86B00","#6030D0","#0891B2","#097348","#9B1C2E","#2357E8","#D6409F"]);
@@ -1445,7 +1502,8 @@ function ProfileSettingsCard({email,accountType,currentUsername,currentEmoji,cur
     try{
       await fetch(`${BACKEND}/api/profile/update`,{method:"PUT",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({email,persona:accountType,username:username.trim()||null,avatar_emoji:emoji||null,avatar_color:swatch||null})});
-      setSaveMsg({ok:true,text:"Saved — refresh to see changes everywhere."});
+      setSaveMsg({ok:true,text:"Saved."});
+      onSaved?.({username:username.trim()||null,avatar_emoji:emoji||null,avatar_color:swatch||null});
     }catch(e){setSaveMsg({ok:false,text:"Could not save. Check the backend is running."});}
     setSaving(false);
   };
@@ -1541,12 +1599,30 @@ function ProfileSettingsCard({email,accountType,currentUsername,currentEmoji,cur
   );
 }
 
-function ProfileCard({name,role,tenure,initial,color,skills,skillLabels,bw,cert,certStatus,certExp,badges,memberProjects,projectIssues,persona,email,userId,username,avatarEmoji,avatarColor,accountType}){
-  const myProjects=(memberProjects?.[name]||[]).map(code=>{
-    const proj=ALL_PROJECTS.find(p=>p.code===code);
-    const openIssues=(projectIssues?.[code]||[]).filter(i=>i.status!=="Done").length;
-    return{...proj,code,openIssues};
-  }).filter(Boolean);
+function ProfileCard({name,role,tenure,initial,color,skills,skillLabels,bw,cert,certStatus,certExp,badges,memberProjects,projectIssues,persona,email,userId,username,avatarEmoji,avatarColor,accountType,onAvatarSaved}){
+  const isRealUser=!!userId; // only real registered accounts get edit/avatar/password controls
+
+  // Real accounts show their actual imported/assigned projects (same source as
+  // the Projects tab), not the client-side demo mock state — the two must not
+  // disagree about whether someone has projects.
+  const [realProjects,setRealProjects]=useState(null);
+  const [realProjectsErr,setRealProjectsErr]=useState(false);
+  useEffect(()=>{
+    if(!isRealUser) return;
+    setRealProjectsErr(false);
+    const q=email?`email=${encodeURIComponent(email)}`:`member_name=${encodeURIComponent(name||"")}`;
+    fetch(`${BACKEND}/api/projects/my-client?${q}`,{credentials:"include"})
+      .then(r=>r.json()).then(d=>setRealProjects(d.projects||[]))
+      .catch(()=>{setRealProjects([]);setRealProjectsErr(true);});
+  },[isRealUser,email,name]);
+
+  const myProjects = isRealUser
+    ? (realProjects||[]).map(p=>({code:p.project_code||String(p.id),title:p.title,status:p.status||p.health_status||"Active",openIssues:0}))
+    : (memberProjects?.[name]||[]).map(code=>{
+        const proj=ALL_PROJECTS.find(p=>p.code===code);
+        const openIssues=(projectIssues?.[code]||[]).filter(i=>i.status!=="Done").length;
+        return{...proj,code,openIssues};
+      }).filter(Boolean);
 
   const bwAuto=(persona==="exp"||persona==="nj2")&&memberProjects&&projectIssues
     ?calcBW(name,memberProjects,projectIssues)
@@ -1554,13 +1630,12 @@ function ProfileCard({name,role,tenure,initial,color,skills,skillLabels,bw,cert,
   const displayBW=bwAuto?bwAuto.pct:bw;
   const bwColor=displayBW<50?P.red:displayBW<75?P.amber:P.grn;
   const effColor=avatarColor||color;
-  const isRealUser=!!userId; // only real registered accounts get edit/avatar/password controls
 
   return(<div style={{padding:"20px 0",maxWidth:620,margin:"0 auto"}}>
     {/* Header card */}
     <Card style={{padding:"20px 22px",marginBottom:12}}>
       <div style={{display:"flex",alignItems:"center",gap:16}}>
-        <Avatar src={avatarSrc(persona)} alt={username||name} size={56}/>
+        <UserAvatarCircle emoji={avatarEmoji} color={effColor} persona={persona} alt={username||name} size={56}/>
         <div style={{flex:1}}>
           <div style={{fontSize:17,fontWeight:500,color:P.txt,letterSpacing:-.3}}>{username||name}</div>
           <div style={{fontSize:12.5,color:P.muted,marginTop:2}}>{role} · {tenure}</div>
@@ -1573,7 +1648,7 @@ function ProfileCard({name,role,tenure,initial,color,skills,skillLabels,bw,cert,
       {bwAuto&&<div style={{marginTop:12,fontSize:11.5,color:P.dim}}>Auto-calculated · {bwAuto.used}h committed across {myProjects.length} project{myProjects.length!==1?"s":""} · {bwAuto.total}h base</div>}
     </Card>
 
-    {isRealUser&&<ProfileSettingsCard email={email} accountType={accountType} currentUsername={username} currentEmoji={avatarEmoji} currentColor={avatarColor} fallbackColor={color}/>}
+    {isRealUser&&<ProfileSettingsCard email={email} accountType={accountType} currentUsername={username} currentEmoji={avatarEmoji} currentColor={avatarColor} fallbackColor={color} onSaved={onAvatarSaved}/>}
 
     {/* Projects */}
     {myProjects.length>0&&<Card style={{padding:"18px 22px",marginBottom:12}}>
@@ -1594,7 +1669,11 @@ function ProfileCard({name,role,tenure,initial,color,skills,skillLabels,bw,cert,
     </Card>}
     {myProjects.length===0&&<Card style={{padding:"16px 22px",marginBottom:12}}>
       <div style={{fontSize:13.5,fontWeight:600,color:P.txt,marginBottom:6}}>My Projects</div>
-      <div style={{fontSize:13,color:P.muted}}>Not assigned to any projects yet. Your manager will assign you when you pass the capstone gate.</div>
+      <div style={{fontSize:13,color:realProjectsErr?P.red:P.muted}}>
+        {realProjectsErr
+          ? "Couldn't load your projects — the server may be unreachable. Try refreshing."
+          : "Not assigned to any projects yet. Your manager will assign you when you pass the capstone gate."}
+      </div>
     </Card>}
 
     {/* Skills */}
@@ -2755,7 +2834,7 @@ function LearningAssistant({groqKey,onLog,onJudge,profile,githubToken,onConfUpda
                 );
               })()}
             </div>
-            {isUser&&<div style={{flexShrink:0,marginTop:2}}><Avatar src={avatarSrc(profile?.persona)} alt={profile?.name||"You"} size={28}/></div>}
+            {isUser&&<div style={{flexShrink:0,marginTop:2}}><UserAvatarCircle emoji={profile?.avatar_emoji} color={profile?.avatar_color||profile?.color} persona={profile?.persona} alt={profile?.name||"You"} size={28}/></div>}
           </div>
         );
       })}
@@ -2829,136 +2908,6 @@ function LearningAssistant({groqKey,onLog,onJudge,profile,githubToken,onConfUpda
     )}
   </div>);
 }
-
-// ── EXP Projects ──────────────────────────────────────────────────────────────
-
-function ExpProjects({name,memberProjects,projectIssues,setProjectIssues,manager}){
-  const myProjectCodes=memberProjects[name]||[];
-  const [view,setView]=useState("mine"); // mine | all
-  const [activeProj,setActiveProj]=useState(myProjectCodes[0]||ALL_PROJECTS[0].code);
-  const [newTitle,setNewTitle]=useState("");
-  const [newPriority,setNewPriority]=useState("Medium");
-
-  // Projects logged via Weekly Tracker (project_allocations) — same data, shown here too
-  const [loggedProjects,setLoggedProjects]=useState([]);
-  const [loadingLogged,setLoadingLogged]=useState(true);
-  useEffect(()=>{
-    fetch(`${BACKEND}/api/allocations?manager=${encodeURIComponent(manager||"Michael Torres")}&member=${encodeURIComponent(name)}`)
-      .then(r=>r.json()).then(d=>{setLoggedProjects(d?.allocations||[]);setLoadingLogged(false);})
-      .catch(()=>setLoadingLogged(false));
-  },[name,manager]);
-
-  const addIssue=(code)=>{
-    if(!newTitle.trim())return;
-    const existing=projectIssues[code]||[];
-    const maxId=Math.max(0,...existing.map(i=>i.id));
-    setProjectIssues(prev=>({...prev,[code]:[...existing,{id:maxId+1,title:newTitle.trim(),status:"Open",priority:newPriority,time:"Just now"}]}));
-    setNewTitle("");
-  };
-  const cycleStatus=(code,id)=>{
-    const order=["Open","In Progress","Done"];
-    setProjectIssues(prev=>({...prev,[code]:(prev[code]||[]).map(i=>i.id===id?{...i,status:order[(order.indexOf(i.status)+1)%order.length]}:i)}));
-  };
-
-  const displayProjects = view==="mine"
-    ? ALL_PROJECTS.filter(p=>myProjectCodes.includes(p.code))
-    : ALL_PROJECTS.filter(p=>!myProjectCodes.includes(p.code));
-
-  const proj=ALL_PROJECTS.find(p=>p.code===activeProj)||ALL_PROJECTS[0];
-  const isMyProject=myProjectCodes.includes(activeProj);
-
-  return(<div style={{padding:20,maxWidth:760,margin:"0 auto"}}>
-    {/* Projects logged via Weekly Tracker */}
-    <div style={{marginBottom:22}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-        <div style={{fontSize:13,fontWeight:500,color:P.txt}}>My Logged Projects <span style={{color:P.muted,fontWeight:400}}>(from Weekly Tracker)</span></div>
-      </div>
-      {loadingLogged&&<div style={{fontSize:12.5,color:P.muted,padding:"10px 0"}}>Loading…</div>}
-      {!loadingLogged&&loggedProjects.length===0&&
-        <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,padding:"14px 16px",fontSize:12.5,color:P.muted}}>
-          No projects logged yet. Go to <strong>Weekly Tracker</strong> to add your first project.
-        </div>}
-      {loggedProjects.length>0&&<div style={{display:"flex",flexDirection:"column",gap:8}}>
-        {loggedProjects.map(a=>{
-          const daysRem=a.end_date?Math.ceil((new Date(a.end_date)-new Date())/86400000):null;
-          const drColor=daysRem==null?P.muted:daysRem<=30?P.red:daysRem<=60?P.amber:P.grn;
-          return(
-            <div key={a.id} style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,padding:"12px 16px"}}>
-              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5,flexWrap:"wrap"}}>
-                <span style={{fontSize:13,fontWeight:600,color:P.txt}}>{a.project_name||"(unnamed)"}</span>
-                <span style={{fontSize:10.5,color:P.dim,background:P.bfaint,borderRadius:4,padding:"1px 6px"}}>{a.project_id}</span>
-                <span style={{fontSize:10.5,fontWeight:600,color:HEALTH_COLOR[a.health_status]||P.muted,background:(HEALTH_COLOR[a.health_status]||P.muted)+"18",borderRadius:4,padding:"1px 7px"}}>{a.health_status}</span>
-              </div>
-              <div style={{fontSize:11.5,color:P.muted,display:"flex",gap:8,flexWrap:"wrap"}}>
-                <span>{a.industry}</span><span>·</span><span>{a.phase}</span><span>·</span><span>{a.stage}</span><span>·</span>
-                <span>{a.hrs_per_week} hrs/wk</span><span>·</span>
-                <span style={{color:drColor,fontWeight:600}}>{daysRem!=null?`${daysRem}d remaining`:"no end date"}</span>
-              </div>
-            </div>
-          );
-        })}
-      </div>}
-    </div>
-
-    {/* View toggle */}
-    <div style={{display:"flex",gap:8,marginBottom:16}}>
-      {[{id:"mine",label:`My Projects (${myProjectCodes.length})`},{id:"all",label:`Other Projects (${ALL_PROJECTS.length-myProjectCodes.length})`}].map(v=>(
-        <button key={v.id} onClick={()=>{setView(v.id);const codes=v.id==="mine"?myProjectCodes:ALL_PROJECTS.filter(p=>!myProjectCodes.includes(p.code)).map(p=>p.code);if(codes.length)setActiveProj(codes[0]);}} style={{padding:"8px 18px",border:`1.5px solid ${view===v.id?P.blue:P.border}`,borderRadius:8,background:view===v.id?P.blueGh:"transparent",color:view===v.id?P.blue:P.txt,fontWeight:view===v.id?700:400,fontSize:13,cursor:"pointer"}}>{v.label}</button>
-      ))}
-    </div>
-
-    {displayProjects.length===0&&<Card style={{padding:24,textAlign:"center"}}><div style={{fontSize:13,color:P.muted}}>No projects in this category. Ask your manager to assign you to a project.</div></Card>}
-
-    {/* Project selector */}
-    {displayProjects.length>0&&<div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-      {displayProjects.map(p=>(
-        <button key={p.code} onClick={()=>setActiveProj(p.code)} style={{minWidth:160,flex:1,background:activeProj===p.code?p.color+"18":"transparent",border:`1.5px solid ${activeProj===p.code?p.color:P.border}`,borderRadius:9,padding:"10px 14px",cursor:"pointer",textAlign:"left"}}>
-          <div style={{fontSize:11,fontWeight:500,color:p.color,textTransform:"uppercase",letterSpacing:.4,marginBottom:2}}>{p.sector||p.code}</div>
-          <div style={{fontSize:12.5,fontWeight:500,color:P.txt,marginBottom:3}}>{p.title}</div>
-          <div style={{display:"flex",gap:6,alignItems:"center"}}>
-            <span style={{fontSize:10,fontWeight:500,padding:"1px 7px",borderRadius:4,background:p.status==="Blocked"?P.redBg:p.status==="Planning"?P.amberBg:P.grnBg,color:p.status==="Blocked"?P.red:p.status==="Planning"?P.amber:P.grn}}>{p.status}</span>
-            <span style={{fontSize:10,color:P.dim}}>{p.sprint}</span>
-          </div>
-        </button>
-      ))}
-    </div>}
-
-    {/* Issue board */}
-    {proj&&<Card style={{marginBottom:14}}>
-      <div style={{padding:"11px 16px",background:P.bg,borderBottom:`1px solid ${P.bfaint}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div>
-          <span style={{fontSize:13,fontWeight:500,color:P.txt}}>{proj.sector||proj.code} — {proj.title}</span>
-          {!isMyProject&&<span style={{marginLeft:8,fontSize:11,color:P.muted,background:P.bfaint,borderRadius:4,padding:"1px 7px"}}>View only</span>}
-        </div>
-        <span style={{fontSize:11,color:P.muted}}>{(projectIssues[activeProj]||[]).filter(i=>canViewIssue(i,"exp",activeProj,memberProjects,name)&&i.status!=="Done").length} open</span>
-      </div>
-      {(projectIssues[activeProj]||[]).filter(iss=>canViewIssue(iss,"exp",activeProj,memberProjects,name)).length===0&&<div style={{padding:"20px 16px",fontSize:13,color:P.muted,textAlign:"center"}}>No visible issues.</div>}
-      {(projectIssues[activeProj]||[]).filter(iss=>canViewIssue(iss,"exp",activeProj,memberProjects,name)).map(iss=>(
-        <div key={iss.id} style={{display:"flex",alignItems:"center",gap:12,padding:"11px 16px",borderBottom:`1px solid ${P.bfaint}`}}>
-          <div style={{flex:1}}>
-            <div style={{fontSize:13,fontWeight:600,color:P.txt,marginBottom:4}}>{iss.title}</div>
-            <div style={{display:"flex",gap:6,alignItems:"center"}}><PriorityBadge p={iss.priority}/><span style={{fontSize:11,color:P.dim}}>{iss.time}</span></div>
-          </div>
-          {isMyProject&&<button onClick={()=>cycleStatus(activeProj,iss.id)} style={{background:"transparent",border:"none",cursor:"pointer",padding:0}}><StatusBadge s={iss.status}/></button>}
-          {!isMyProject&&<StatusBadge s={iss.status}/>}
-        </div>
-      ))}
-    </Card>}
-
-    {/* Add issue — only for my projects */}
-    {isMyProject&&<Card style={{padding:16}}>
-      <div style={{fontSize:12.5,fontWeight:500,color:P.txt,marginBottom:10}}>Add Issue to {proj?.code}</div>
-      <div style={{display:"flex",gap:8,marginBottom:8}}>
-        <input value={newTitle} onChange={e=>setNewTitle(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addIssue(activeProj)} placeholder="Issue title…" style={{flex:1,border:`1px solid ${P.border}`,borderRadius:7,padding:"8px 12px",fontSize:13,outline:"none",background:P.bg,color:P.txt}}/>
-        <select value={newPriority} onChange={e=>setNewPriority(e.target.value)} style={{border:`1px solid ${P.border}`,borderRadius:7,padding:"8px 10px",fontSize:13,background:P.bg,color:P.txt,cursor:"pointer"}}>
-          {["High","Medium","Low"].map(p=><option key={p}>{p}</option>)}
-        </select>
-        <button onClick={()=>addIssue(activeProj)} disabled={!newTitle.trim()} style={{background:P.blue,color:"#fff",border:"none",borderRadius:7,padding:"8px 16px",fontSize:13,fontWeight:600,cursor:"pointer"}}>Add</button>
-      </div>
-    </Card>}
-  </div>);
-}
-
 
 // ── Study Materials · mindmap + summary doc generator ────────────────────────
 const TRACK_LABELS_FOR_STUDY_MATERIALS={"rtcdp":"Real-Time CDP","analytics":"Adobe Analytics","ajo":"Adobe Journey Optimizer","cja":"Customer Journey Analytics"};
@@ -4577,7 +4526,7 @@ function LearningPathView({profile:p,groqKey,done,studyModule,setStudyModule,exp
     setCompleting(true);
     try{
       await fetch(`${BACKEND}/api/progress/complete`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({member_name:p.name,manager:p.manager||"Michael Torres",track,module_id:moduleId,module_title:moduleTitle})});
+        body:JSON.stringify({member_name:p.name,manager:p.manager||(p.email?"":"Michael Torres"),track,module_id:moduleId,module_title:moduleTitle})});
       setCompletedIds(prev=>prev.includes(moduleId)?prev:[...prev,moduleId]);
     }catch(e){console.warn("Mark complete failed",e);}
     setCompleting(false);
@@ -6557,12 +6506,112 @@ function MetricCard({label,note,value,unit,pct,grad,valColor}){
 }
 
 
+// ── WeeklyUtilCard — real hrs/week committed across assigned projects vs. a
+// 40h week, shown on the homepage. Fetches live data every time, never a
+// static/sample number.
+function WeeklyUtilCard({profile}){
+  const [total,setTotal]=useState(null);
+  useEffect(()=>{
+    const q=profile.email?`email=${encodeURIComponent(profile.email)}`:`member_name=${encodeURIComponent(profile.name||"")}`;
+    fetch(`${BACKEND}/api/projects/my-client?${q}`,{credentials:"include"})
+      .then(r=>r.json())
+      .then(d=>setTotal((d.projects||[]).reduce((s,pr)=>s+(parseFloat(pr.hrs_per_week)||0),0)))
+      .catch(()=>setTotal(0));
+  },[profile.email,profile.name]);
+
+  const base=40;
+  const used=total??0;
+  const left=Math.max(0,base-used);
+  const pct=Math.min(100,Math.round((used/base)*100));
+  const barColor=pct>100?P.red:pct>85?P.amber:P.grn;
+
+  return(
+    <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:14,padding:"16px 18px",
+      display:"flex",flexDirection:"column",gap:10,minWidth:200}}>
+      <div style={{fontSize:11,fontWeight:700,letterSpacing:.5,textTransform:"uppercase",color:P.dim}}>This week</div>
+      {total===null ? (
+        <div style={{fontSize:12.5,color:P.muted}}>Loading…</div>
+      ) : (
+        <>
+          <div style={{display:"flex",alignItems:"baseline",gap:6}}>
+            <span style={{fontSize:26,fontWeight:600,color:P.txt,letterSpacing:-.5}}>{left}h</span>
+            <span style={{fontSize:12.5,color:P.muted}}>left of {base}h</span>
+          </div>
+          <div style={{height:6,borderRadius:999,background:P.bfaint,overflow:"hidden"}}>
+            <div style={{height:"100%",width:`${pct}%`,background:barColor,borderRadius:999,transition:"width .3s"}}/>
+          </div>
+          <div style={{fontSize:11.5,color:P.muted}}>{used}h committed across your projects{pct>100?" — over 40h":""}</div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── CohortCard — real peer-progress ranking (modules completed, from
+// user_module_progress), shown on the home page. Only shown for real
+// registered accounts with actual peers in the same grouping — no fictional
+// names, hidden entirely rather than showing a lonely/fake list.
+// `endpoint` decides the grouping: New Joiners group by track
+// (/api/cohort/ranking), experienced staff group by team + tenure band
+// (/api/cohort/exp-ranking). `subtitle` renders the grouping label from the
+// response.
+function CohortCard({profile,endpoint,subtitle}){
+  const [data,setData]=useState(undefined); // undefined=loading, null=no data, {}=loaded
+
+  useEffect(()=>{
+    if(!profile.email){ setData(null); return; }
+    fetch(`${BACKEND}${endpoint}?email=${encodeURIComponent(profile.email)}`,{credentials:"include"})
+      .then(r=>r.json()).then(setData).catch(()=>setData(null));
+  },[profile.email,endpoint]);
+
+  if(data===null || (data && (data.cohort||[]).length<=1)) return null; // nothing meaningful to compare
+  if(data===undefined) return(
+    <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:14,padding:"16px 18px",minWidth:220}}>
+      <div style={{fontSize:11,fontWeight:700,letterSpacing:.5,textTransform:"uppercase",color:P.dim,marginBottom:8}}>Your cohort</div>
+      <div style={{fontSize:12.5,color:P.muted}}>Loading…</div>
+    </div>
+  );
+
+  const board=data.cohort||[];
+  const top=board.slice(0,4);
+  const you=board.find(c=>c.is_you);
+  const youShown=top.some(c=>c.is_you);
+
+  return(
+    <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:14,padding:"16px 18px",minWidth:220}}>
+      <div style={{fontSize:11,fontWeight:700,letterSpacing:.5,textTransform:"uppercase",color:P.dim,marginBottom:10}}>
+        Your cohort <span style={{fontWeight:400,textTransform:"none",color:P.dim}}>· {subtitle(data)}</span>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:7}}>
+        {top.map(c=>(
+          <div key={c.rank} style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:11,fontWeight:700,color:c.is_you?P.blue:P.dim,width:14,flexShrink:0}}>{c.rank}</span>
+            <span style={{fontSize:12.5,fontWeight:c.is_you?600:400,color:c.is_you?P.blue:P.txt,flex:1,
+              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.is_you?"You":c.name}</span>
+            <span style={{fontSize:11.5,color:P.muted,flexShrink:0}}>{c.modules_done} modules</span>
+          </div>
+        ))}
+        {!youShown&&you&&(
+          <div style={{display:"flex",alignItems:"center",gap:8,borderTop:`1px solid ${P.bfaint}`,paddingTop:7,marginTop:1}}>
+            <span style={{fontSize:11,fontWeight:700,color:P.blue,width:14,flexShrink:0}}>{you.rank}</span>
+            <span style={{fontSize:12.5,fontWeight:600,color:P.blue,flex:1}}>You</span>
+            <span style={{fontSize:11.5,color:P.muted,flexShrink:0}}>{you.modules_done} modules</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function NJDash({onLogout,groqKey,onLog,onJudge,profile,githubToken,onToggleTheme}){
   const [tab,setTab]=useState("overview");
   const [studyModule,setStudyModule]=useState(null);
   const [expandedModule,setExpandedModule]=useState(null);
   const [lessonModule,setLessonModule]=useState(null);
-  const p=profile||PROFILES.nj;
+  // Avatar/username changes from Profile settings apply here immediately
+  // (header, sidebar, everywhere `p` is used) — no page refresh needed.
+  const [avatarOverride,setAvatarOverride]=useState(null);
+  const p={...(profile||PROFILES.nj), ...(avatarOverride||{})};
 
   // Determine track from team
   const track=getTrack(p);
@@ -6665,16 +6714,9 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
   ];
   const {mobile}=useViewport();
 
-  const cohort=[
-    {name:"Kate Moore", conf:85,rank:1},
-    {name:"Rachel Kim", conf:82,rank:2},
-    {name:p.name,       conf:confPct,rank:3,isYou:true},
-    {name:"Jordan Lee", conf:61,rank:4},
-  ];
-
   return(<div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'adobe-clean','Source Sans 3',system-ui,sans-serif",background:P.bg}}>
     <GlobalStyles/>
-    <Nav initial={p.initial} name={p.username||p.name} sub={`${p.role} · ${p.tenure}`} color={p.avatar_color||p.color} avatarEmoji={p.avatar_emoji} persona={p.persona||"nj"} onLogout={onLogout} progress={liveConf*100} onToggleTheme={onToggleTheme}/>
+    <Nav initial={p.initial} name={p.username||p.name} sub={`${p.role} · ${p.tenure}`} color={p.avatar_color||p.color} avatarEmoji={p.avatar_emoji} persona={p.persona||"nj"} onLogout={onLogout} progress={liveConf*100} onToggleTheme={onToggleTheme} onGoToProfile={()=>setTab("profile")}/>
     {mobile?<Tabs items={tabs} active={tab} onChange={setTab}/>:<SideNav items={tabs} active={tab} onChange={setTab}/>}
     <div className="nx-main-content" style={{flex:1,overflowY:"auto",paddingLeft:mobile?0:SIDENAV_WIDTH}}>
 
@@ -6731,6 +6773,12 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
                 </button>
               </div>
             </div>
+          </div>
+
+          {/* Quick stats — real data, sits beside the hero as compact side cards */}
+          <div style={{display:"flex",gap:12,flexWrap:"wrap",margin:"16px 0"}}>
+            <WeeklyUtilCard profile={p}/>
+            <CohortCard profile={p} endpoint="/api/cohort/ranking" subtitle={d=>(d.track||"").toUpperCase()}/>
           </div>
 
           {/* Your AI agents */}
@@ -6834,7 +6882,7 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
       {tab==="community"&&<div style={{height:"calc(100vh - 104px)",overflowY:"auto"}}><NJCommunity profile={p}/></div>}
       {lessonModule&&<ModuleLesson module={lessonModule} groqKey={groqKey} track={track} userId={p?.id||p?.email||""} onClose={()=>setLessonModule(null)}/>}
       {tab==="profile"&&<div style={{maxWidth:640,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
-        <ProfileCard name={p.name} role={p.role} tenure={`${p.track_label||p.team} · ${p.tenure}`} initial={p.initial} color={p.color} skills={p.skills} skillLabels={SKILLS} bw={liveBW} cert={p.cert.name} certStatus={p.cert.status} certExp={p.cert.exp} badges={p.badges} memberProjects={{[p.name]:p.projects||[]}} projectIssues={{}} persona={p.persona||"nj"} email={p.email} userId={p.id} username={p.username} avatarEmoji={p.avatar_emoji} avatarColor={p.avatar_color} accountType="learner"/>
+        <ProfileCard name={p.name} role={p.role} tenure={`${p.track_label||p.team} · ${p.tenure}`} initial={p.initial} color={p.color} skills={p.skills} skillLabels={SKILLS} bw={liveBW} cert={p.cert.name} certStatus={p.cert.status} certExp={p.cert.exp} badges={p.badges} memberProjects={{[p.name]:p.projects||[]}} projectIssues={{}} persona={p.persona||"nj"} email={p.email} userId={p.id} username={p.username} avatarEmoji={p.avatar_emoji} avatarColor={p.avatar_color} accountType="learner" onAvatarSaved={setAvatarOverride}/>
         {/* BW live update */}
         <Card style={{padding:"20px 24px"}}>
           <div style={{fontSize:14,fontWeight:600,color:P.txt,marginBottom:4}}>Update Bandwidth</div>
@@ -6932,7 +6980,10 @@ function SiteFooter({setTab,mobile,cols}){
 }
 
 function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProjects,setMemberProjects,projectIssues,setProjectIssues,onToggleTheme}){
-  const p=profile||PROFILES.exp;
+  // Avatar/username changes from Profile settings apply here immediately
+  // (header, sidebar, everywhere `p` is used) — no page refresh needed.
+  const [avatarOverride,setAvatarOverride]=useState(null);
+  const p={...(profile||PROFILES.exp), ...(avatarOverride||{})};
   // Skills come from profile by default; per-skill quiz can override individual skills
   const [skillOverrides,setSkillOverrides]=useState({});
   useEffect(()=>{
@@ -7006,16 +7057,16 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
   // Load enrolled tracks and per-track progress from DB
   useEffect(()=>{
     if(!p.id||!p.name)return;
-    const mgr=p.manager||"Michael Torres";
+    const mgr=p.manager||(p.email?"":"Michael Torres");
     fetch(`${BACKEND}/api/tracks/enrolled?member=${encodeURIComponent(p.name)}${p.id?`&member_id=${p.id}`:""}${p.email?`&email=${encodeURIComponent(p.email)}`:""}`)
       .then(r=>r.json()).then(d=>{
         if(d?.enrolled_tracks?.length>0)setEnrolledTracks(d.enrolled_tracks);
         else setEnrolledTracks([primaryTrack]);
       }).catch(()=>setEnrolledTracks([primaryTrack]));
-    fetch(`${BACKEND}/api/tracks/progress?member=${encodeURIComponent(p.name)}&manager=${encodeURIComponent(mgr)}`)
+    if(mgr)fetch(`${BACKEND}/api/tracks/progress?member=${encodeURIComponent(p.name)}&manager=${encodeURIComponent(mgr)}`)
       .then(r=>r.json()).then(d=>{ if(d?.progress)setTrackProgress(d.progress); })
       .catch(()=>{});
-  },[p.name]);
+  },[p.name,p.manager,p.email,p.id]);
 
   const enrollInTrack=async(trackId)=>{
     // Demo personas (no real onboarding id) still get the local UI update —
@@ -7194,7 +7245,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
       // Persist the actual skill level for real (DB-backed) users so it survives refresh and shows on the Manager's Skill Matrix
       if(p.id){
         fetch(`${BACKEND}/api/skills/assess`,{method:"POST",headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({member_name:p.name,manager:p.manager||"Michael Torres",skill:catState.skill,level:finalLevel,theta:newTheta})}).catch(()=>{});
+          body:JSON.stringify({member_name:p.name,manager:p.manager||(p.email?"":"Michael Torres"),skill:catState.skill,level:finalLevel,theta:newTheta})}).catch(()=>{});
       }
     } else {
       const remaining=items.filter(it=>!usedIds.includes(it.id));
@@ -7207,7 +7258,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
           body:JSON.stringify({persona:"exp",event_type:"cat_complete",module:catState.skill,
             detail:`θ=${newTheta.toFixed(2)} → ${finalLevel} · ${newResponses.length} items (bank exhausted)`})}).catch(()=>{});
         if(p.id) fetch(`${BACKEND}/api/skills/assess`,{method:"POST",headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({member_name:p.name,manager:p.manager||"Michael Torres",skill:catState.skill,level:finalLevel,theta:newTheta})}).catch(()=>{});
+          body:JSON.stringify({member_name:p.name,manager:p.manager||(p.email?"":"Michael Torres"),skill:catState.skill,level:finalLevel,theta:newTheta})}).catch(()=>{});
       } else {
         setCatState(prev=>({...prev,responses:newResponses,thetas:newThetas,currentItem:nextItem,usedIds:[...usedIds,nextItem.id]}));
       }
@@ -7217,7 +7268,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
   // CAT Quiz overlay
   if(activeSkillQuiz&&catState) return(
     <div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"system-ui,-apple-system,sans-serif",background:P.bg}}>
-      <Nav initial={p.initial} name={p.username||p.name} sub={`${p.role} · ${p.team}`} color={p.avatar_color||p.color} avatarEmoji={p.avatar_emoji} persona={p.persona||"exp"} onLogout={onLogout} onToggleTheme={onToggleTheme}/>
+      <Nav initial={p.initial} name={p.username||p.name} sub={`${p.role} · ${p.team}`} color={p.avatar_color||p.color} avatarEmoji={p.avatar_emoji} persona={p.persona||"exp"} onLogout={onLogout} onToggleTheme={onToggleTheme} onGoToProfile={()=>setTab("profile")}/>
       <div style={{flex:1,overflowY:"auto",padding:20}}>
         <button onClick={()=>{setActiveSkillQuiz(null);setCatState(null);}} style={{display:"flex",alignItems:"center",gap:6,background:"transparent",border:`1px solid ${P.border}`,borderRadius:7,padding:"6px 12px",fontSize:12.5,cursor:"pointer",color:P.txt,marginBottom:16}}><Ic as={ChevronLeft} size={14} color="currentColor"/> Back</button>
 
@@ -7342,7 +7393,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
   ].filter(Boolean).join(" · ");
   return(<div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'adobe-clean','Source Sans 3',system-ui,sans-serif",background:P.bg}}>
     <GlobalStyles/>
-    <Nav initial={p.initial} name={p.username||p.name} sub={`${p.role} · ${p.tenure}`} color={p.avatar_color||p.color} avatarEmoji={p.avatar_emoji} persona={p.persona||"exp"} onLogout={onLogout} onToggleTheme={onToggleTheme}/>
+    <Nav initial={p.initial} name={p.username||p.name} sub={`${p.role} · ${p.tenure}`} color={p.avatar_color||p.color} avatarEmoji={p.avatar_emoji} persona={p.persona||"exp"} onLogout={onLogout} onToggleTheme={onToggleTheme} onGoToProfile={()=>setTab("profile")}/>
     {mobile?<Tabs items={tabs} active={tab} onChange={setTab}/>:<SideNav items={tabs} active={tab} onChange={setTab}/>}
     <div className="nx-main-content" style={{flex:1,overflowY:"auto",paddingLeft:mobile?0:SIDENAV_WIDTH}}>
 
@@ -7610,6 +7661,12 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
                 </div>
               </div>
 
+          {/* Quick stats — real data, sits beside the hero as compact side cards */}
+          <div style={{display:"flex",gap:12,flexWrap:"wrap",margin:"16px 0"}}>
+            <WeeklyUtilCard profile={p}/>
+            <CohortCard profile={p} endpoint="/api/cohort/exp-ranking" subtitle={d=>`${d.team||""} · ${d.tenure_band||""}`}/>
+          </div>
+
           {/* Your AI agents — real, live agent sessions (not static feature copy).
               Home is intentionally scoped to Hero + Agents + Other Features only;
               the cross-skill/upskill track picker lives in the Learning Path tab
@@ -7846,7 +7903,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
         </div>{/* /row */}
       </div>}
       {tab==="profile"&&<div style={{maxWidth:640,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
-        <ProfileCard name={p.name} role={p.role} tenure={`${p.track_label||p.team} · ${p.tenure}`} initial={p.initial} color={p.color} skills={selfSkills} skillLabels={SKILLS} bw={p.bw} cert={p.cert.name} certStatus={p.cert.status} certExp={p.cert.exp} badges={p.badges} memberProjects={memberProjects} projectIssues={projectIssues} persona="exp" email={p.email} userId={p.id} username={p.username} avatarEmoji={p.avatar_emoji} avatarColor={p.avatar_color} accountType="learner"/>
+        <ProfileCard name={p.name} role={p.role} tenure={`${p.track_label||p.team} · ${p.tenure}`} initial={p.initial} color={p.color} skills={selfSkills} skillLabels={SKILLS} bw={p.bw} cert={p.cert.name} certStatus={p.cert.status} certExp={p.cert.exp} badges={p.badges} memberProjects={memberProjects} projectIssues={projectIssues} persona="exp" email={p.email} userId={p.id} username={p.username} avatarEmoji={p.avatar_emoji} avatarColor={p.avatar_color} accountType="learner" onAvatarSaved={setAvatarOverride}/>
         {/* Skills self-assessment — replaces the standalone Skill Development tab.
             Feeds cross-skilling recommendations + the home skill-gap count. */}
         <Card style={{padding:"18px 20px"}}>
@@ -7923,7 +7980,10 @@ function MemberDetail({member,onBack,memberProjects}){
     </Card>
     {/* Cert */}
     {cert&&<Card style={{padding:18,marginBottom:14}}>
-      <div style={{fontSize:12.5,fontWeight:500,color:P.txt,marginBottom:10}}>Certification</div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <div style={{fontSize:12.5,fontWeight:500,color:P.txt}}>Certification</div>
+        <span title="This drill-down uses a small hardcoded demo dataset (MEMBER_CERTS), not the real certifications table — it will not match this member's actual cert record." style={{fontSize:9.5,fontWeight:700,letterSpacing:.4,color:P.amber,background:P.amberBg,border:`1px solid ${P.amber}40`,borderRadius:4,padding:"1px 6px",textTransform:"uppercase"}}>Sample data</span>
+      </div>
       <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 13px",background:cert.status==="Active"?P.grnBg:cert.status==="In Progress"?P.blueGh:P.amberBg,border:`1px solid ${cert.status==="Active"?P.grn+"40":cert.status==="In Progress"?P.blue+"40":P.amber+"40"}`,borderRadius:8}}>
         <span style={{fontSize:16}}>🎖</span><div style={{flex:1}}><div style={{fontSize:13,fontWeight:600,color:P.txt}}>{cert.cert}</div><div style={{fontSize:11,color:P.muted}}>Expires {cert.exp}{cert.days?` · ${cert.days}d remaining`:""}</div></div>
         <span style={{fontSize:11,fontWeight:500,color:cert.status==="Active"?P.grn:cert.status==="In Progress"?P.blue:P.amber}}>{cert.status}</span>
@@ -8026,24 +8086,29 @@ function AllocationModal({initial,lockedMember,onSave,onClose}){
 function WeeklyUpdatesPanel({allocId,memberName,onClose}){
   const [updates,setUpdates]=useState([]);
   const [loading,setLoading]=useState(true);
+  const [loadErr,setLoadErr]=useState(false);
   const [comment,setComment]=useState("");
   const [health,setHealth]=useState("");
   const [posting,setPosting]=useState(false);
+  const [postErr,setPostErr]=useState(false);
 
   const load=()=>{
-    fetch(`${BACKEND}/api/allocations/${allocId}/updates`).then(r=>r.json()).then(d=>{setUpdates(d?.updates||[]);setLoading(false);}).catch(()=>setLoading(false));
+    setLoadErr(false);
+    fetch(`${BACKEND}/api/allocations/${allocId}/updates`).then(r=>r.json()).then(d=>{setUpdates(d?.updates||[]);setLoading(false);})
+      .catch(()=>{setLoading(false);setLoadErr(true);});
   };
   useEffect(()=>{load();},[allocId]);
 
   const post=async()=>{
     if(!comment.trim())return;
-    setPosting(true);
+    setPosting(true);setPostErr(false);
     try{
-      await fetch(`${BACKEND}/api/allocations/${allocId}/updates`,{method:"POST",headers:{"Content-Type":"application/json"},
+      const res=await fetch(`${BACKEND}/api/allocations/${allocId}/updates`,{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({member_name:memberName,comment:comment.trim(),health_status:health||null})});
+      if(!res.ok)throw new Error(String(res.status));
       setComment("");setHealth("");
       load();
-    }catch(e){console.warn("Post update failed",e);}
+    }catch(e){console.warn("Post update failed",e);setPostErr(true);}
     setPosting(false);
   };
 
@@ -8067,12 +8132,14 @@ function WeeklyUpdatesPanel({allocId,memberName,onClose}){
               {posting?"Posting…":"+ Post update"}
             </button>
           </div>
+          {postErr&&<div style={{marginTop:8,fontSize:12,color:P.red}}>Couldn't post your update — the server may be unreachable. Please try again.</div>}
         </div>
         {/* Update history — shown first */}
         <div style={{maxHeight:280,overflowY:"auto"}}>
           <div style={{padding:"10px 20px 6px",fontSize:10.5,fontWeight:600,color:P.dim,letterSpacing:.5,textTransform:"uppercase",borderBottom:`1px solid ${P.bfaint}`}}>Update history</div>
           {loading&&<div style={{padding:20,textAlign:"center",color:P.muted,fontSize:12.5}}>Loading…</div>}
-          {!loading&&updates.length===0&&<div style={{padding:"16px 20px",textAlign:"center",color:P.muted,fontSize:12.5}}>No updates yet — post your first one below.</div>}
+          {!loading&&loadErr&&<div style={{padding:"16px 20px",textAlign:"center",color:P.red,fontSize:12.5}}>Couldn't load update history — the server may be unreachable.</div>}
+          {!loading&&!loadErr&&updates.length===0&&<div style={{padding:"16px 20px",textAlign:"center",color:P.muted,fontSize:12.5}}>No updates yet — post your first one below.</div>}
           {updates.map(u=>(
             <div key={u.id} style={{padding:"10px 20px",borderBottom:`1px solid ${P.bfaint}`}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
@@ -8130,15 +8197,24 @@ function NJProgressBar({done,total,conf,confTarget=0.75}){
 
 // ── NJ Tracker Summary — shows logged projects inline in overview ──────────
 function NJTrackerSummary({profile:p,onGoToTracker}){
-  const manager=p.manager||"Michael Torres";
+  const manager=p.manager||(p.email?"":"Michael Torres");
   const [allocs,setAllocs]=useState([]);
   const [loaded,setLoaded]=useState(false);
+  const [err,setErr]=useState(false);
   useEffect(()=>{
-    if(!p.name)return;
+    if(!p.name||!manager)return;
+    setErr(false);
     fetch(`${BACKEND}/api/allocations?manager=${encodeURIComponent(manager)}&member=${encodeURIComponent(p.name)}`)
-      .then(r=>r.json()).then(d=>{setAllocs(d?.allocations||[]);setLoaded(true);}).catch(()=>setLoaded(true));
-  },[p.name]);
-  if(!loaded||allocs.length===0)return null;
+      .then(r=>r.json()).then(d=>{setAllocs(d?.allocations||[]);setLoaded(true);})
+      .catch(()=>{setLoaded(true);setErr(true);});
+  },[p.name,manager]);
+  if(!loaded)return null;
+  if(err)return(
+    <Card style={{padding:"14px 16px"}}>
+      <div style={{fontSize:12,color:P.red}}>Couldn't load your projects — the server may be unreachable.</div>
+    </Card>
+  );
+  if(allocs.length===0)return null;
   return(
     <Card style={{padding:"14px 16px"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
@@ -8165,18 +8241,23 @@ function NJTrackerSummary({profile:p,onGoToTracker}){
 // ── Team Leaderboard — points ranked by reporting manager ────────────────
 function TeamLeaderboardWidget({profile:p}){
   const [board,setBoard]=useState([]);
-  const manager=p.manager||"Michael Torres";
+  const [err,setErr]=useState(false);
+  const manager=p.manager||(p.email?"":"Michael Torres");
   useEffect(()=>{
-    if(!p.name)return;
-    fetch(`${BACKEND}/api/points/team?manager=${encodeURIComponent(manager)}`)
-      .then(r=>r.json()).then(d=>setBoard(d?.leaderboard||[])).catch(()=>{});
-    const iv=setInterval(()=>{
-      fetch(`${BACKEND}/api/points/team?manager=${encodeURIComponent(manager)}`)
-        .then(r=>r.json()).then(d=>setBoard(d?.leaderboard||[])).catch(()=>{});
-    },60000);
+    if(!p.name||!manager)return;
+    const fetchBoard=()=>fetch(`${BACKEND}/api/points/team?manager=${encodeURIComponent(manager)}`)
+      .then(r=>r.json()).then(d=>{setBoard(d?.leaderboard||[]);setErr(false);}).catch(()=>setErr(true));
+    fetchBoard();
+    const iv=setInterval(fetchBoard,60000);
     return()=>clearInterval(iv);
   },[p.name,manager]);
-  if(!p.id||board.length===0)return null;
+  if(!p.id)return null;
+  if(err&&board.length===0)return(
+    <Card style={{padding:"16px 18px"}}>
+      <div style={{fontSize:12,color:P.red}}>Couldn't load the team leaderboard — the server may be unreachable.</div>
+    </Card>
+  );
+  if(board.length===0)return null;
   const medals=["🥇","🥈","🥉"];
   return(
     <Card style={{padding:"16px 18px"}}>
@@ -8270,13 +8351,14 @@ function WeekCalendar({weekOf}){
 }
 
 function UtilizationSummaryCard({profile:p}){
-  const manager=p.manager||"Michael Torres";
+  const manager=p.manager||(p.email?"":"Michael Torres");
   const qtr=Math.ceil((new Date().getMonth()+1)/3);
   const yr=new Date().getFullYear();
   const qLabels=["Jan–Mar","Apr–Jun","Jul–Sep","Oct–Dec"];
   const quarterLabel=`Q${qtr} ${yr} · ${qLabels[qtr-1]}`;
 
   const [billed,setBilled]=useState(null);   // fetched from /api/billing/summary
+  const [billedErr,setBilledErr]=useState(false);
   const [cfTarget]=useState(75);             // could be user-configurable later
   const [showCal,setShowCal]=useState(false);
 
@@ -8284,11 +8366,12 @@ function UtilizationSummaryCard({profile:p}){
   const availableHours=getQuarterAvailableHours(qtr,yr);
 
   useEffect(()=>{
-    if(!p.name||!p.id)return;
+    if(!p.name||!p.id||!manager)return;
+    setBilledErr(false);
     fetch(`${BACKEND}/api/billing/summary?manager=${encodeURIComponent(manager)}&member=${encodeURIComponent(p.name)}&year=${yr}&quarter=${qtr}`)
       .then(r=>r.json()).then(d=>setBilled(d))
-      .catch(()=>{});
-  },[p.name]);
+      .catch(()=>setBilledErr(true));
+  },[p.name,manager,yr,qtr]);
 
   const totalBilled=billed?.total_billed||0;
   const cfUtil=availableHours>0?Math.round((totalBilled/availableHours)*100):0;
@@ -8334,6 +8417,7 @@ function UtilizationSummaryCard({profile:p}){
         {availableHours}h available this quarter · 8h/day excl. weekends &amp; APAC holidays
         {billed?.weeks_logged>0?` · ${billed.weeks_logged}wk logged`:""}
       </div>
+      {billedErr&&<div style={{fontSize:11,color:P.red,marginTop:4}}>Couldn't load billing data — the server may be unreachable.</div>}
 
       {/* Per-project breakdown */}
       {billed?.breakdown?.length>0&&(
@@ -8383,7 +8467,7 @@ function UtilFiveColumns({cfTotal,avail,cfUtil,cfTarget,cfAchieved}){
   );
 }
 function UtilizationWidget({profile:p}){
-  const manager=p.manager||"Michael Torres";
+  const manager=p.manager||(p.email?"":"Michael Torres");
   // Get Monday of current week
   const thisMonday=()=>{
     const d=new Date();d.setHours(0,0,0,0);
@@ -8399,13 +8483,13 @@ function UtilizationWidget({profile:p}){
 
   // Load existing entry for this week
   useEffect(()=>{
-    if(!p.name||!p.id)return setLoading(false);
+    if(!p.name||!p.id||!manager)return setLoading(false);
     fetch(`${BACKEND}/api/utilization?manager=${encodeURIComponent(manager)}&member=${encodeURIComponent(p.name)}&week_of=${weekOf}`)
       .then(r=>r.json()).then(d=>{
         if(d?.entry)setEntry(e=>({...e,...d.entry}));
         setLoading(false);
       }).catch(()=>setLoading(false));
-  },[p.name,weekOf]);
+  },[p.name,manager,weekOf]);
 
   const n=(k)=>Number(entry[k]||0);
   const availableHours=Math.max(n("working_hours")-n("holiday_hours")-n("loa_hours"),0.01);
@@ -8585,15 +8669,24 @@ function ProjectBillingForm({allocation:a,memberName,manager}){
 }
 
 function MyWeeklyTracker({profile:p}){
-  const manager=p.manager||"";
   const q=p.email?`email=${encodeURIComponent(p.email)}`:`member_name=${encodeURIComponent(p.name||"")}`;
 
-  // ── Projects (client work) ──────────────────────────────────────────────────
-  const [allocs,setAllocs]=useState([]);
-  const [allocLoading,setAllocLoading]=useState(true);
-  const [showAdd,setShowAdd]=useState(false);
-  const [editing,setEditing]=useState(null);
-  const [updatesFor,setUpdatesFor]=useState(null);
+  // ── Projects (client work) — real assigned projects, same source as the
+  // Projects tab and what the manager sees in Team Weekly Tracker. This used
+  // to read a separate, self-logged project_allocations table which could
+  // disagree with the real data; now there's one source of truth.
+  const [myProjects,setMyProjects]=useState([]);
+  const [projLoading,setProjLoading]=useState(true);
+  const [editingProj,setEditingProj]=useState(null); // project being edited
+  const [projForm,setProjForm]=useState({});
+  const [savingProj,setSavingProj]=useState(false);
+
+  // Weekly notes — append-only history (mirrors the Initiatives pattern below):
+  // every post is a new timestamped row, never an overwrite of the last one.
+  const [projUpdates,setProjUpdates]=useState({});      // projectId → [{...}]
+  const [expandedProjNotes,setExpandedProjNotes]=useState({}); // projectId → bool
+  const [newProjNoteText,setNewProjNoteText]=useState({});     // projectId → draft
+  const [postingProjNote,setPostingProjNote]=useState(null);
 
   // ── Initiatives ─────────────────────────────────────────────────────────────
   const [initiatives,setInitiatives]=useState([]);
@@ -8609,16 +8702,65 @@ function MyWeeklyTracker({profile:p}){
   const [showAddMile,setShowAddMile]=useState(false);
 
   const loadAll=()=>{
-    setAllocLoading(true);
-    fetch(`${BACKEND}/api/allocations?manager=${encodeURIComponent(manager)}&member=${encodeURIComponent(p.name)}`)
-      .then(r=>r.json()).then(d=>{setAllocs(d?.allocations||[]);setAllocLoading(false);})
-      .catch(()=>setAllocLoading(false));
+    setProjLoading(true);
+    fetch(`${BACKEND}/api/projects/my-client?${q}`,{credentials:"include"})
+      .then(r=>r.json()).then(d=>{setMyProjects(d.projects||[]);setProjLoading(false);})
+      .catch(()=>setProjLoading(false));
     fetch(`${BACKEND}/api/initiatives/my?${q}`,{credentials:"include"})
       .then(r=>r.json()).then(d=>setInitiatives(d?.initiatives||[])).catch(()=>{});
     fetch(`${BACKEND}/api/milestones/my?${q}`,{credentials:"include"})
       .then(r=>r.json()).then(d=>setMilestones(d?.milestones||[])).catch(()=>{});
   };
   useEffect(()=>{loadAll();},[]);
+
+  const openEditProj=(proj)=>{
+    setProjForm({
+      hrs_per_week: proj.hrs_per_week||0,
+      role_on_project: proj.role_on_project||"",
+      health_status: proj.health_status||"",
+      status: proj.status||"In Progress",
+    });
+    setEditingProj(proj);
+  };
+  const saveProj=async()=>{
+    if(!editingProj)return;
+    setSavingProj(true);
+    try{
+      await fetch(`${BACKEND}/api/projects/${editingProj.id}/my-update`,{
+        method:"PUT",credentials:"include",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({...projForm, email:p.email||p.name, member_name:p.name||""})
+      });
+      setEditingProj(null); loadAll();
+    } finally { setSavingProj(false); }
+  };
+  const totalHrs=myProjects.reduce((s,proj)=>s+(parseFloat(proj.hrs_per_week)||0),0);
+  const utilPct=Math.round((totalHrs/40)*100);
+  const projStatusColor=s=>s==="In Progress"?P.blue:s==="Blocked"?P.red:s==="Completed"?P.grn:P.amber;
+  const projStatusBg=s=>s==="In Progress"?P.blueGh:s==="Blocked"?P.redLt:s==="Completed"?P.grnBg:P.amberBg;
+
+  const toggleProjNotes=async(proj)=>{
+    const open=!expandedProjNotes[proj.id];
+    setExpandedProjNotes(e=>({...e,[proj.id]:open}));
+    if(open&&!projUpdates[proj.id]){
+      const d=await fetch(`${BACKEND}/api/projects/${proj.id}/updates`,{credentials:"include"}).then(r=>r.json()).catch(()=>({updates:[]}));
+      setProjUpdates(u=>({...u,[proj.id]:d.updates||[]}));
+    }
+  };
+  const postProjNote=async(proj)=>{
+    const text=(newProjNoteText[proj.id]||"").trim();
+    if(!text)return;
+    setPostingProjNote(proj.id);
+    try{
+      const res=await fetch(`${BACKEND}/api/projects/${proj.id}/updates`,{method:"POST",credentials:"include",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({member_email:p.email||"", member_name:p.name||"", update_text:text})});
+      const d=await res.json();
+      setMyProjects(ps=>ps.map(x=>x.id===proj.id?{...x,weekly_comments:text}:x));
+      setProjUpdates(u=>({...u,[proj.id]:[{id:d.id,member_name:p.name,update_text:text,created_at:d.created_at},...(u[proj.id]||[])]}));
+      setNewProjNoteText(t=>({...t,[proj.id]:""}));
+    } finally { setPostingProjNote(null); }
+  };
 
   const loadInitUpdates=async(id)=>{
     const d=await fetch(`${BACKEND}/api/initiatives/${id}/updates`,{credentials:"include"}).then(r=>r.json()).catch(()=>({updates:[]}));
@@ -8654,17 +8796,6 @@ function MyWeeklyTracker({profile:p}){
     setShowAddMile(false);loadAll();
   };
 
-  const save=async(payload)=>{
-    const url=editing?`${BACKEND}/api/allocations/${editing.id}`:`${BACKEND}/api/allocations`;
-    const method=editing?"PUT":"POST";
-    const body={...payload,member_name:p.name,manager};
-    await fetch(url,{method,credentials:"include",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-    setShowAdd(false);setEditing(null);loadAll();
-  };
-
-  const totalHrs=allocs.reduce((s,a)=>s+(parseFloat(a.hrs_per_week)||0),0);
-  const utilPct=Math.round((totalHrs/40)*100);
-
   const inputSt={width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"7px 11px",
     fontSize:12.5,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit"};
 
@@ -8685,70 +8816,120 @@ function MyWeeklyTracker({profile:p}){
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
           <div style={{fontSize:15,fontWeight:700,color:P.txt}}>
             Projects
-            <span style={{fontSize:12,fontWeight:400,color:P.muted,marginLeft:8}}>Client work & allocations</span>
+            <span style={{fontSize:12,fontWeight:400,color:P.muted,marginLeft:8}}>Assigned by your manager</span>
           </div>
-          <div style={{display:"flex",gap:10,alignItems:"center"}}>
-            <div style={{fontSize:12,color:totalHrs>40?P.red:P.muted}}>
-              <b style={{color:totalHrs>40?P.red:P.txt}}>{totalHrs}</b>/40 hrs · <b style={{color:utilPct>100?P.red:utilPct>80?P.amber:P.grn}}>{utilPct}%</b> utilised
-            </div>
-            <button onClick={()=>{setEditing(null);setShowAdd(true);}}
-              style={{background:P.red,color:"#fff",border:"none",borderRadius:8,
-                padding:"7px 14px",fontSize:12.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
-              + Add project
-            </button>
+          <div style={{fontSize:12,color:totalHrs>40?P.red:P.muted}}>
+            <b style={{color:totalHrs>40?P.red:P.txt}}>{totalHrs}</b>/40 hrs · <b style={{color:utilPct>100?P.red:utilPct>80?P.amber:P.grn}}>{utilPct}%</b> utilised
           </div>
         </div>
 
-        {allocLoading&&<div style={{fontSize:12.5,color:P.muted,textAlign:"center",padding:20}}>Loading…</div>}
+        {projLoading&&<div style={{fontSize:12.5,color:P.muted,textAlign:"center",padding:20}}>Loading…</div>}
 
-        {!allocLoading&&allocs.length===0&&(
+        {!projLoading&&myProjects.length===0&&(
           <div style={{background:P.surface,border:`1px solid ${P.border}`,borderRadius:10,
             padding:"18px 20px",fontSize:12.5,color:P.muted,textAlign:"center"}}>
-            No projects logged yet. Click "+ Add project" to get started, or import your tracker via Admin → Tracker Import.
+            No projects assigned yet. Your manager assigns projects via the Project Board / tracker import — they'll appear here once added.
           </div>
         )}
 
-        {allocs.map(a=>(
-          <div key={a.id} style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,
+        {myProjects.map(proj=>(
+          <div key={proj.id} style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,
             marginBottom:10,overflow:"hidden"}}>
-            <div style={{display:"flex",alignItems:"center",gap:12,padding:"13px 18px",
-              borderBottom:updatesFor===a.id||editing?.id===a.id?`1px solid ${P.border}`:"none"}}>
-              <div style={{flex:1}}>
-                <div style={{fontSize:14,fontWeight:600,color:P.txt}}>{a.project_name}</div>
-                <div style={{fontSize:11.5,color:P.muted,marginTop:2}}>
-                  {a.project_type&&<span>{a.project_type} · </span>}
-                  {a.industry&&<span>{a.industry} · </span>}
-                  <span style={{fontWeight:600,color:a.hrs_per_week>0?P.txt:P.dim}}>{a.hrs_per_week||0}h/wk</span>
-                  {a.stage&&<span> · {a.stage}</span>}
-                  {a.end_date&&<span> · Ends {a.end_date}</span>}
+            {editingProj?.id===proj.id?(
+              <div style={{padding:"14px 18px"}}>
+                <div style={{fontSize:13.5,fontWeight:600,color:P.txt,marginBottom:12}}>Update: {proj.title}</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                  <div>
+                    <div style={{fontSize:11.5,fontWeight:600,color:P.muted,marginBottom:4}}>My hrs/week</div>
+                    <input type="number" min="0" max="40" style={inputSt} value={projForm.hrs_per_week}
+                      onChange={e=>setProjForm(f=>({...f,hrs_per_week:e.target.value}))}/>
+                  </div>
+                  <div>
+                    <div style={{fontSize:11.5,fontWeight:600,color:P.muted,marginBottom:4}}>My role</div>
+                    <input style={inputSt} value={projForm.role_on_project}
+                      onChange={e=>setProjForm(f=>({...f,role_on_project:e.target.value}))}/>
+                  </div>
+                  <div>
+                    <div style={{fontSize:11.5,fontWeight:600,color:P.muted,marginBottom:4}}>Status</div>
+                    <select style={inputSt} value={projForm.status} onChange={e=>setProjForm(f=>({...f,status:e.target.value}))}>
+                      {["Planning","In Progress","Blocked","Completed"].map(s=><option key={s}>{s}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <div style={{fontSize:11.5,fontWeight:600,color:P.muted,marginBottom:4}}>Health</div>
+                    <input style={inputSt} value={projForm.health_status}
+                      onChange={e=>setProjForm(f=>({...f,health_status:e.target.value}))} placeholder="On track, At risk…"/>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={saveProj} disabled={savingProj}
+                    style={{background:P.blue,color:"#fff",border:"none",borderRadius:8,padding:"7px 14px",
+                      fontSize:12.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{savingProj?"Saving…":"Save"}</button>
+                  <button onClick={()=>setEditingProj(null)}
+                    style={{background:"transparent",border:`1px solid ${P.border}`,borderRadius:8,padding:"7px 14px",
+                      fontSize:12.5,cursor:"pointer",color:P.txt,fontFamily:"inherit"}}>Cancel</button>
                 </div>
               </div>
-              <span style={{fontSize:11.5,fontWeight:600,padding:"2px 9px",borderRadius:4,
-                background:a.health_status==="At risk"?P.redLt:a.health_status==="Blocked"?P.redLt:P.grnBg,
-                color:a.health_status==="At risk"||a.health_status==="Blocked"?P.red:P.grn}}>
-                {a.health_status||"On track"}
-              </span>
-              <button onClick={()=>{setEditing(a);setShowAdd(true);setUpdatesFor(null);}}
-                style={{fontSize:11.5,color:P.blue,background:P.blueGh,border:`1px solid ${P.blue}20`,
-                  borderRadius:6,padding:"3px 10px",cursor:"pointer",fontFamily:"inherit"}}>Edit</button>
-              <button onClick={()=>{setUpdatesFor(updatesFor===a.id?null:a.id);setShowAdd(false);setEditing(null);}}
-                style={{fontSize:11.5,color:P.purple,background:P.purple+"10",border:`1px solid ${P.purple}20`,
-                  borderRadius:6,padding:"3px 10px",cursor:"pointer",fontFamily:"inherit"}}>Weekly note</button>
-            </div>
-            {editing?.id===a.id&&showAdd&&(
-              <div style={{padding:"14px 18px"}}>
-                <AllocationModal initial={editing} lockedMember={p.name} onSave={save}
-                  onClose={()=>{setShowAdd(false);setEditing(null);}}/>
+            ):(
+              <div style={{padding:"13px 18px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:12}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:14,fontWeight:600,color:P.txt}}>{proj.title}</div>
+                    <div style={{fontSize:11.5,color:P.muted,marginTop:2}}>
+                      {proj.project_type&&<span>{proj.project_type} · </span>}
+                      {proj.industry&&<span>{proj.industry} · </span>}
+                      <span style={{fontWeight:600,color:proj.hrs_per_week>0?P.txt:P.dim}}>{proj.hrs_per_week||0}h/wk</span>
+                      {proj.stage&&<span> · {proj.stage}</span>}
+                      {proj.end_date&&<span> · Ends {proj.end_date}</span>}
+                    </div>
+                  </div>
+                  <span style={{fontSize:11.5,fontWeight:600,padding:"2px 9px",borderRadius:4,
+                    background:projStatusBg(proj.health_status||proj.status),color:projStatusColor(proj.health_status||proj.status)}}>
+                    {proj.health_status||proj.status||"Active"}
+                  </span>
+                  <button onClick={()=>openEditProj(proj)}
+                    style={{fontSize:11.5,color:P.blue,background:P.blueGh,border:`1px solid ${P.blue}20`,
+                      borderRadius:6,padding:"3px 10px",cursor:"pointer",fontFamily:"inherit"}}>Update</button>
+                </div>
+
+                {/* Weekly note — append-only: latest note shown, with a
+                    toggle to post a new one and see the full timestamped history. */}
+                {proj.weekly_comments&&<div style={{fontSize:12,color:P.txt,marginTop:8,padding:"6px 10px",
+                  background:P.blueGh,borderRadius:6}}>{proj.weekly_comments}</div>}
+                <button onClick={()=>toggleProjNotes(proj)}
+                  style={{fontSize:11,color:P.blue,background:"none",border:"none",cursor:"pointer",
+                    padding:0,marginTop:6,fontFamily:"inherit"}}>
+                  {expandedProjNotes[proj.id]?"▲ Hide history":"▼ Post a weekly update / view history"}
+                </button>
+                {expandedProjNotes[proj.id]&&(
+                  <div style={{marginTop:8,padding:"10px 12px",background:P.surface,borderRadius:8}}>
+                    <div style={{display:"flex",gap:8}}>
+                      <textarea rows={2} value={newProjNoteText[proj.id]||""}
+                        onChange={e=>setNewProjNoteText(t=>({...t,[proj.id]:e.target.value}))}
+                        placeholder="What's the update this week?"
+                        style={{...inputSt,flex:1,minHeight:0,resize:"none"}}/>
+                      <button onClick={()=>postProjNote(proj)} disabled={postingProjNote===proj.id||!(newProjNoteText[proj.id]||"").trim()}
+                        style={{background:P.blue,color:"#fff",border:"none",borderRadius:8,padding:"0 14px",
+                          fontSize:12,cursor:"pointer",fontFamily:"inherit",flexShrink:0,
+                          opacity:!(newProjNoteText[proj.id]||"").trim()?0.5:1}}>
+                        {postingProjNote===proj.id?"Posting…":"Post"}
+                      </button>
+                    </div>
+                    <div style={{marginTop:10}}>
+                      {(projUpdates[proj.id]||[]).length===0&&<div style={{fontSize:12,color:P.muted}}>No history yet.</div>}
+                      {(projUpdates[proj.id]||[]).map(u=>(
+                        <div key={u.id} style={{display:"flex",gap:12,padding:"6px 0",borderBottom:`1px solid ${P.bfaint}`}}>
+                          <span style={{fontSize:10.5,color:P.dim,flexShrink:0,width:120}}>{u.created_at?.replace("T"," ").slice(0,16)}</span>
+                          <span style={{fontSize:12.5,color:P.txt}}>{u.update_text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
-            {updatesFor===a.id&&(
-              <WeeklyUpdatesPanel allocId={a.id} memberName={p.name} onClose={()=>setUpdatesFor(null)}/>
             )}
           </div>
         ))}
-
-        {showAdd&&!editing&&<AllocationModal initial={null} lockedMember={p.name} onSave={save}
-          onClose={()=>{setShowAdd(false);setEditing(null);}}/>}
       </div>
 
       {/* ══════════════════════════════════════════════════════════════════════
@@ -8970,57 +9151,29 @@ function TeamUtilizationSection({manager,onGoToTracker}){
   );
 }
 
-// ── MyProjectsView — Individual member sees their assigned projects ────────────
+// ── MyProjectsView — Individual member sees their assigned projects (read-only
+// — updating hrs/role/status/weekly notes happens in Weekly Tracker, so
+// there's exactly one place to log a weekly update, not two that could drift) ─
 function MyProjectsView({profile}){
   const [projects,setProjects]=useState([]);
   const [loading,setLoading]=useState(true);
-  const [editing,setEditing]=useState(null); // project being edited
-  const [saving,setSaving]=useState(false);
-  const [form,setForm]=useState({});
 
-  const load=()=>{
+  useEffect(()=>{
     const q=profile.email?`email=${encodeURIComponent(profile.email)}`:`member_name=${encodeURIComponent(profile.name||"")}`;
     fetch(`${BACKEND}/api/projects/my-client?${q}`,{credentials:"include"})
       .then(r=>r.json()).then(d=>{ setProjects(d.projects||[]); setLoading(false); })
       .catch(()=>setLoading(false));
-  };
-  useEffect(()=>{ load(); },[profile.email,profile.name]);
-
-  const openEdit=(p)=>{
-    setForm({
-      hrs_per_week: p.hrs_per_week||0,
-      role_on_project: p.role_on_project||"",
-      weekly_comments: p.weekly_comments||"",
-      health_status: p.health_status||"",
-      status: p.status||"In Progress",
-    });
-    setEditing(p);
-  };
-
-  const save=async()=>{
-    if(!editing)return;
-    setSaving(true);
-    try{
-      await fetch(`${BACKEND}/api/projects/${editing.id}/my-update`,{
-        method:"PUT",credentials:"include",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({...form, email:profile.email||profile.name})
-      });
-      setEditing(null); load();
-    }finally{setSaving(false);}
-  };
+  },[profile.email,profile.name]);
 
   const statusColor=s=>s==="In Progress"?P.blue:s==="Blocked"?P.red:s==="Completed"?P.grn:P.amber;
   const statusBg=s=>s==="In Progress"?P.blueGh:s==="Blocked"?P.redLt:s==="Completed"?P.grnBg:P.amberBg;
-  const inputSt={width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"7px 11px",
-    fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit"};
 
   return(
     <div style={{maxWidth:860,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
       <div>
         <div style={{fontSize:18,fontWeight:500,color:P.txt,marginBottom:4}}>My Projects</div>
         <div style={{fontSize:13,color:P.muted}}>
-          {loading?"Loading…":`${projects.length} project${projects.length!==1?"s":""} you are assigned to`}
+          {loading?"Loading…":`${projects.length} project${projects.length!==1?"s":""} you are assigned to — update hrs, status, and weekly notes from Weekly Tracker.`}
         </div>
       </div>
 
@@ -9034,85 +9187,41 @@ function MyProjectsView({profile}){
 
       {projects.map(proj=>(
         <Card key={proj.id} style={{overflow:"hidden"}}>
-          {editing?.id===proj.id?(
-            <div style={{padding:"18px 20px"}}>
-              <div style={{fontSize:14,fontWeight:600,color:P.txt,marginBottom:16}}>Update: {proj.title}</div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
-                <div>
-                  <div style={{fontSize:12,fontWeight:600,color:P.muted,marginBottom:4}}>My hrs/week on this project</div>
-                  <input type="number" min="0" max="40" style={inputSt} value={form.hrs_per_week}
-                    onChange={e=>setForm(f=>({...f,hrs_per_week:e.target.value}))}/>
+          <div style={{padding:"16px 20px"}}>
+            <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12,marginBottom:10}}>
+              <div>
+                {proj.sector&&<div style={{fontSize:10,fontWeight:700,color:P.blue,letterSpacing:.6,textTransform:"uppercase",marginBottom:3}}>{proj.sector}</div>}
+                <div style={{fontSize:15,fontWeight:600,color:P.txt,marginBottom:4}}>{proj.title}</div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                  <span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:4,
+                    background:statusBg(proj.status),color:statusColor(proj.status)}}>{proj.status}</span>
+                  {proj.tag&&<span style={{fontSize:11,color:P.muted}}>{proj.tag}</span>}
+                  {proj.industry&&<span style={{fontSize:11,color:P.muted}}>{proj.industry}</span>}
+                  {proj.phase&&<span style={{fontSize:11,color:P.muted}}>{proj.phase}</span>}
                 </div>
-                <div>
-                  <div style={{fontSize:12,fontWeight:600,color:P.muted,marginBottom:4}}>My role on project</div>
-                  <input style={inputSt} value={form.role_on_project}
-                    onChange={e=>setForm(f=>({...f,role_on_project:e.target.value}))}
-                    placeholder="e.g. Technical Architect"/>
-                </div>
-                <div>
-                  <div style={{fontSize:12,fontWeight:600,color:P.muted,marginBottom:4}}>Project status</div>
-                  <select style={inputSt} value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value}))}>
-                    {["Planning","In Progress","Blocked","Completed"].map(s=><option key={s}>{s}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <div style={{fontSize:12,fontWeight:600,color:P.muted,marginBottom:4}}>Health / Status</div>
-                  <input style={inputSt} value={form.health_status}
-                    onChange={e=>setForm(f=>({...f,health_status:e.target.value}))}
-                    placeholder="e.g. On track, At risk"/>
-                </div>
-                <div style={{gridColumn:"1/-1"}}>
-                  <div style={{fontSize:12,fontWeight:600,color:P.muted,marginBottom:4}}>Weekly comments / blockers</div>
-                  <textarea style={{...inputSt,minHeight:64,resize:"vertical"}} value={form.weekly_comments}
-                    onChange={e=>setForm(f=>({...f,weekly_comments:e.target.value}))}
-                    placeholder="Any blockers, updates, or notes for this week"/>
-                </div>
-              </div>
-              <div style={{display:"flex",gap:8}}>
-                <Button variant="accent" size="S" onPress={save} isDisabled={saving}>{saving?"Saving…":"Save"}</Button>
-                <Button variant="secondary" size="S" onPress={()=>setEditing(null)}>Cancel</Button>
               </div>
             </div>
-          ):(
-            <div style={{padding:"16px 20px"}}>
-              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12,marginBottom:10}}>
-                <div>
-                  {proj.sector&&<div style={{fontSize:10,fontWeight:700,color:P.blue,letterSpacing:.6,textTransform:"uppercase",marginBottom:3}}>{proj.sector}</div>}
-                  <div style={{fontSize:15,fontWeight:600,color:P.txt,marginBottom:4}}>{proj.title}</div>
-                  <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-                    <span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:4,
-                      background:statusBg(proj.status),color:statusColor(proj.status)}}>{proj.status}</span>
-                    {proj.tag&&<span style={{fontSize:11,color:P.muted}}>{proj.tag}</span>}
-                    {proj.industry&&<span style={{fontSize:11,color:P.muted}}>{proj.industry}</span>}
-                    {proj.phase&&<span style={{fontSize:11,color:P.muted}}>{proj.phase}</span>}
-                  </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:proj.weekly_comments?10:0}}>
+              {[
+                ["My hrs/week",proj.hrs_per_week?`${proj.hrs_per_week}h`:"—"],
+                ["My role",proj.role_on_project||"—"],
+                ["Health",proj.health_status||proj.status||"—"],
+                proj.start_date&&["Start",proj.start_date],
+                proj.end_date&&["End",proj.end_date],
+                proj.solutions_used&&["Solutions",proj.solutions_used],
+              ].filter(Boolean).map(([l,v])=>(
+                <div key={l} style={{background:P.surface,borderRadius:8,padding:"8px 12px"}}>
+                  <div style={{fontSize:10,fontWeight:600,color:P.dim,letterSpacing:.4,marginBottom:2}}>{l}</div>
+                  <div style={{fontSize:12.5,color:P.txt,fontWeight:500}}>{v}</div>
                 </div>
-                <ActionButton size="S" onPress={()=>openEdit(proj)}>
-                  <Ic as={Edit} size={13} color="currentColor"/> Update
-                </ActionButton>
-              </div>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:proj.weekly_comments?10:0}}>
-                {[
-                  ["My hrs/week",proj.hrs_per_week?`${proj.hrs_per_week}h`:"—"],
-                  ["My role",proj.role_on_project||"—"],
-                  ["Health",proj.health_status||proj.status||"—"],
-                  proj.start_date&&["Start",proj.start_date],
-                  proj.end_date&&["End",proj.end_date],
-                  proj.solutions_used&&["Solutions",proj.solutions_used],
-                ].filter(Boolean).map(([l,v])=>(
-                  <div key={l} style={{background:P.surface,borderRadius:8,padding:"8px 12px"}}>
-                    <div style={{fontSize:10,fontWeight:600,color:P.dim,letterSpacing:.4,marginBottom:2}}>{l}</div>
-                    <div style={{fontSize:12.5,color:P.txt,fontWeight:500}}>{v}</div>
-                  </div>
-                ))}
-              </div>
-              {proj.weekly_comments&&(
-                <div style={{background:P.amberBg,border:`1px solid ${P.amber}20`,borderRadius:8,padding:"8px 12px",fontSize:12.5,color:P.txt}}>
-                  <span style={{fontWeight:600,color:P.amber}}>Weekly note: </span>{proj.weekly_comments}
-                </div>
-              )}
+              ))}
             </div>
-          )}
+            {proj.weekly_comments&&(
+              <div style={{background:P.amberBg,border:`1px solid ${P.amber}20`,borderRadius:8,padding:"8px 12px",fontSize:12.5,color:P.txt}}>
+                <span style={{fontWeight:600,color:P.amber}}>Weekly note: </span>{proj.weekly_comments}
+              </div>
+            )}
+          </div>
         </Card>
       ))}
     </div>
@@ -9120,154 +9229,179 @@ function MyProjectsView({profile}){
 }
 
 // ── MgrTeamTrackerView ────────────────────────────────────────────────────────
-function MgrTeamTrackerView({profile, dbMembers}){
-  const [selected, setSelected] = useState(null); // selected member object
-  const [memberData, setMemberData] = useState(null); // {projects, initiatives, milestones}
-  const [loading, setLoading] = useState(false);
+// ── MgrTeamTrackerView — flat, spreadsheet-style project tracker table ────────
+// One row per (project, member) pair, mirroring the imported tracker Excel
+// exactly. Member→manager mapping comes straight from the import (each row
+// is already stamped with manager_email + linked to its member).
+const TRACKER_COLUMNS = [
+  {key:"member_name",      label:"Member",        width:130},
+  {key:"project_code",     label:"Project ID",    width:100},
+  {key:"title",            label:"Project Name",  width:170},
+  {key:"project_type",     label:"Type",          width:110},
+  {key:"industry",         label:"Industry",      width:120},
+  {key:"phase",            label:"Phase",         width:100},
+  {key:"stage",            label:"Stage",         width:100},
+  {key:"start_date",       label:"Start",         width:95},
+  {key:"end_date",         label:"End",           width:95},
+  {key:"days_remaining",   label:"Days Left",     width:80},
+  {key:"hrs_per_week",     label:"Hrs/Wk",        width:70},
+  {key:"use_cases",        label:"Use Cases",     width:150},
+  {key:"solutions_used",   label:"Solutions",     width:140},
+  {key:"product_features", label:"Features",      width:140},
+  {key:"data_sources",     label:"Data Sources",  width:130},
+  {key:"destinations",     label:"Destinations",  width:130},
+  {key:"num_audiences",    label:"Audiences",     width:80},
+  {key:"region",           label:"Region",        width:80},
+  {key:"ticket_ids",       label:"Ticket ID",     width:100},
+  {key:"health_status",    label:"Health",        width:100},
+  {key:"renewal",          label:"Renewal",       width:80},
+  {key:"weekly_comments",  label:"Comments",      width:220, editable:true},
+  {key:"high_level_notes", label:"High-Level Notes", width:220},
+];
 
-  const selectMember = async(member) => {
-    setSelected(member);
-    setLoading(true);
-    const q = member.email
-      ? `email=${encodeURIComponent(member.email)}`
-      : `member_name=${encodeURIComponent(member.full_name||member.name||"")}`;
-    const [projRes, initRes, mileRes] = await Promise.all([
-      fetch(`${BACKEND}/api/projects/my-client?${q}`,{credentials:"include"}).then(r=>r.json()).catch(()=>({projects:[]})),
-      fetch(`${BACKEND}/api/initiatives/my?${q}`,{credentials:"include"}).then(r=>r.json()).catch(()=>({initiatives:[]})),
-      fetch(`${BACKEND}/api/milestones/my?${q}`,{credentials:"include"}).then(r=>r.json()).catch(()=>({milestones:[]})),
-    ]);
-    setMemberData({
-      projects: projRes.projects||[],
-      initiatives: initRes.initiatives||[],
-      milestones: mileRes.milestones||[],
-    });
-    setLoading(false);
+function MgrTeamTrackerView({profile}){
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  // Weekly notes are append-only: expandedRow shows a "post new update" box
+  // plus the full timestamped history for that project, instead of editing
+  // a single overwritable field.
+  const [expandedRow, setExpandedRow] = useState(null); // member_link_id
+  const [history, setHistory] = useState({}); // project_id → updates[]
+  const [historyLoading, setHistoryLoading] = useState(null);
+  const [newUpdateDraft, setNewUpdateDraft] = useState("");
+  const [posting, setPosting] = useState(null);
+
+  const load = () => {
+    const qs = profile.email
+      ? `manager_email=${encodeURIComponent(profile.email)}&manager_name=${encodeURIComponent(profile.name||"")}`
+      : `manager_name=${encodeURIComponent(profile.name||"")}`;
+    fetch(`${BACKEND}/api/projects/tracker-table?${qs}`,{credentials:"include"})
+      .then(r=>r.json()).then(d=>{ setRows(d.rows||[]); setLoading(false); })
+      .catch(()=>setLoading(false));
+  };
+  useEffect(load, [profile.email, profile.name]);
+
+  const statusColor = s => s==="Blocked"||s==="At risk"?P.red:s==="Completed"?P.grn:P.blue;
+  const statusBg    = s => s==="Blocked"||s==="At risk"?P.redLt:s==="Completed"?P.grnBg:P.blueGh;
+
+  const toggleExpand = async(row) => {
+    if(expandedRow===row.member_link_id){ setExpandedRow(null); return; }
+    setExpandedRow(row.member_link_id); setNewUpdateDraft("");
+    if(!history[row.id]){
+      setHistoryLoading(row.member_link_id);
+      const d = await fetch(`${BACKEND}/api/projects/${row.id}/updates`,{credentials:"include"}).then(r=>r.json()).catch(()=>({updates:[]}));
+      setHistory(h=>({...h,[row.id]:d.updates||[]}));
+      setHistoryLoading(null);
+    }
+  };
+  const postUpdate = async(row) => {
+    const text = newUpdateDraft.trim();
+    if(!text) return;
+    setPosting(row.member_link_id);
+    try{
+      const res = await fetch(`${BACKEND}/api/projects/${row.id}/updates`,{method:"POST",credentials:"include",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({member_email:row.member_email||"", member_name:row.member_name||"", update_text:text})});
+      const d = await res.json();
+      setRows(rs=>rs.map(r=>r.member_link_id===row.member_link_id?{...r,weekly_comments:text}:r));
+      setHistory(h=>({...h,[row.id]:[{id:d.id,member_name:row.member_name,update_text:text,created_at:d.created_at},...(h[row.id]||[])]}));
+      setNewUpdateDraft("");
+    } finally { setPosting(null); }
   };
 
-  const statusColor = s => s==="At risk"||s==="Blocked"?P.red:P.grn;
-  const statusBg    = s => s==="At risk"||s==="Blocked"?P.redLt:P.grnBg;
+  const cellSt = {padding:"7px 10px",fontSize:12,color:P.txt,borderBottom:`1px solid ${P.bfaint}`,
+    whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",verticalAlign:"top"};
 
-  // Member list view
-  if(!selected) return(
-    <div style={{maxWidth:860,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
-      <div>
-        <div style={{fontSize:18,fontWeight:500,color:P.txt,marginBottom:4}}>Team Weekly Tracker</div>
-        <div style={{fontSize:13,color:P.muted}}>Click a team member to view their projects, initiatives and milestones.</div>
+  return(
+    <div style={{padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div>
+          <div style={{fontSize:18,fontWeight:500,color:P.txt,marginBottom:4}}>Team Weekly Tracker</div>
+          <div style={{fontSize:13,color:P.muted}}>
+            {loading?"Loading…":`${rows.length} project row${rows.length!==1?"s":""} across your team, from the imported tracker.`}
+          </div>
+        </div>
       </div>
-      {(!dbMembers||dbMembers.length===0)&&(
+
+      {!loading&&rows.length===0&&(
         <Card style={{padding:"36px 24px",textAlign:"center"}}>
-          <div style={{fontSize:13,color:P.muted}}>No team members in directory yet. Upload the HR roster via Admin → User Provisioning.</div>
+          <div style={{fontSize:13,color:P.muted}}>No projects imported yet. Import your team's project tracker via Admin → Project Tracker Import.</div>
         </Card>
       )}
-      {(dbMembers||[]).map(m=>{
-        const name=m.full_name||m.name||m.email;
-        const initials=name.split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
-        return(
-          <Card key={m.email} style={{padding:"14px 20px",cursor:"pointer",display:"flex",alignItems:"center",gap:14,
-            transition:"box-shadow .15s"}}
-            onClick={()=>selectMember(m)}
-            onMouseEnter={e=>e.currentTarget.style.boxShadow=`0 2px 12px ${P.blue}20`}
-            onMouseLeave={e=>e.currentTarget.style.boxShadow=""}>
-            <div style={{width:38,height:38,borderRadius:"50%",background:P.blue,flexShrink:0,
-              display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:600,fontSize:14}}>
-              {initials}
-            </div>
-            <div style={{flex:1}}>
-              <div style={{fontSize:14,fontWeight:500,color:P.txt}}>{name}</div>
-              <div style={{fontSize:12,color:P.muted}}>{m.role||""}{m.team?` · ${m.team}`:""}{m.location?` · ${m.location}`:""}</div>
-            </div>
-            <span style={{fontSize:20,color:P.muted}}>›</span>
-          </Card>
-        );
-      })}
-    </div>
-  );
 
-  // Member detail view
-  const name = selected.full_name||selected.name||selected.email;
-  return(
-    <div style={{maxWidth:860,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:24}}>
-      {/* Back + header */}
-      <div style={{display:"flex",alignItems:"center",gap:12}}>
-        <button onClick={()=>{setSelected(null);setMemberData(null);}}
-          style={{background:"transparent",border:`1px solid ${P.border}`,borderRadius:8,
-            padding:"6px 12px",fontSize:12,cursor:"pointer",color:P.txt,fontFamily:"inherit"}}>← Back</button>
-        <div>
-          <div style={{fontSize:17,fontWeight:600,color:P.txt}}>{name}</div>
-          <div style={{fontSize:12,color:P.muted}}>{selected.role||""}{selected.team?` · ${selected.team}`:""}</div>
+      {rows.length>0&&(
+        <div style={{overflowX:"auto",border:`1px solid ${P.border}`,borderRadius:10}}>
+          <table style={{borderCollapse:"collapse",width:"100%",minWidth:2200}}>
+            <thead>
+              <tr style={{background:P.surface}}>
+                {TRACKER_COLUMNS.map(c=>(
+                  <th key={c.key} style={{position:"sticky",top:0,background:P.surface,textAlign:"left",
+                    padding:"9px 10px",fontSize:11,fontWeight:700,color:P.muted,textTransform:"uppercase",
+                    letterSpacing:0.3,borderBottom:`1px solid ${P.border}`,minWidth:c.width}}>
+                    {c.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(row=>(
+                <tr key={row.member_link_id}>
+                  {TRACKER_COLUMNS.map(c=>{
+                    if(c.key==="health_status") return(
+                      <td key={c.key} style={cellSt}>
+                        {row.health_status&&<span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:4,
+                          background:statusBg(row.health_status),color:statusColor(row.health_status)}}>{row.health_status}</span>}
+                      </td>
+                    );
+                    if(c.editable) return(
+                      <td key={c.key} style={{...cellSt,whiteSpace:"normal",minWidth:c.width}}>
+                        <div style={{cursor:"pointer",color:row.weekly_comments?P.txt:P.dim}} onClick={()=>toggleExpand(row)}>
+                          {row.weekly_comments||"Click to add an update…"}
+                        </div>
+                        <button onClick={()=>toggleExpand(row)}
+                          style={{fontSize:10.5,color:P.blue,background:"none",border:"none",cursor:"pointer",
+                            padding:0,marginTop:2,fontFamily:"inherit"}}>
+                          {expandedRow===row.member_link_id?"▲ Hide history":"▼ Post update / view history"}
+                        </button>
+                        {expandedRow===row.member_link_id&&(
+                          <div style={{marginTop:6,padding:8,background:"#fff",border:`1px solid ${P.border}`,
+                            borderRadius:8,minWidth:240}} onClick={e=>e.stopPropagation()}>
+                            <textarea autoFocus rows={2} value={newUpdateDraft}
+                              onChange={e=>setNewUpdateDraft(e.target.value)}
+                              placeholder="Post a new update…"
+                              style={{width:"100%",fontSize:12,padding:"4px 6px",borderRadius:6,
+                                border:`1px solid ${P.border}`,fontFamily:"inherit",resize:"vertical",boxSizing:"border-box"}}/>
+                            <button onClick={()=>postUpdate(row)} disabled={posting===row.member_link_id||!newUpdateDraft.trim()}
+                              style={{marginTop:4,fontSize:11.5,padding:"4px 10px",borderRadius:6,border:"none",
+                                background:P.blue,color:"#fff",cursor:"pointer",fontFamily:"inherit",
+                                opacity:!newUpdateDraft.trim()?0.5:1}}>
+                              {posting===row.member_link_id?"Posting…":"Post update"}
+                            </button>
+                            <div style={{marginTop:8,borderTop:`1px solid ${P.bfaint}`,paddingTop:6,maxHeight:160,overflowY:"auto"}}>
+                              {historyLoading===row.member_link_id&&<div style={{fontSize:11,color:P.muted}}>Loading…</div>}
+                              {(history[row.id]||[]).length===0&&historyLoading!==row.member_link_id&&
+                                <div style={{fontSize:11,color:P.muted}}>No history yet.</div>}
+                              {(history[row.id]||[]).map(u=>(
+                                <div key={u.id} style={{fontSize:11,color:P.txt,marginBottom:6}}>
+                                  <div style={{color:P.dim,fontSize:10}}>{u.created_at?.replace("T"," ").slice(0,16)}</div>
+                                  {u.update_text}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </td>
+                    );
+                    let val = row[c.key];
+                    if(c.key==="num_audiences"&&!val) val = "";
+                    return <td key={c.key} style={cellSt} title={val||""}>{val!=null&&val!==""?val:"—"}</td>;
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      </div>
-
-      {loading&&<div style={{textAlign:"center",padding:40,color:P.muted,fontSize:13}}>Loading…</div>}
-
-      {!loading&&memberData&&<>
-        {/* Projects */}
-        <div>
-          <div style={{fontSize:14,fontWeight:700,color:P.txt,marginBottom:10}}>
-            Projects <span style={{fontWeight:400,color:P.muted,fontSize:12}}>({memberData.projects.length})</span>
-          </div>
-          {memberData.projects.length===0&&<div style={{fontSize:12.5,color:P.muted,padding:"10px 14px",background:P.surface,borderRadius:8}}>No client projects assigned.</div>}
-          {memberData.projects.map(p=>(
-            <Card key={p.id} style={{padding:"12px 16px",marginBottom:8}}>
-              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12}}>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:13.5,fontWeight:600,color:P.txt,marginBottom:3}}>{p.title}</div>
-                  <div style={{fontSize:11.5,color:P.muted}}>
-                    {p.industry&&<span>{p.industry} · </span>}
-                    {p.phase&&<span>{p.phase} · </span>}
-                    {p.hrs_per_week>0&&<span>{p.hrs_per_week}h/wk · </span>}
-                    {p.start_date&&<span>Start {p.start_date}</span>}
-                    {p.end_date&&<span> → {p.end_date}</span>}
-                  </div>
-                  {p.weekly_comments&&<div style={{fontSize:12,color:P.txt,marginTop:6,padding:"6px 10px",
-                    background:P.blueGh,borderRadius:6}}>{p.weekly_comments}</div>}
-                </div>
-                <span style={{fontSize:11.5,fontWeight:600,padding:"2px 9px",borderRadius:4,flexShrink:0,
-                  background:statusBg(p.health_status),color:statusColor(p.health_status)}}>
-                  {p.health_status||p.status||"Active"}
-                </span>
-              </div>
-            </Card>
-          ))}
-        </div>
-
-        {/* Initiatives */}
-        <div>
-          <div style={{fontSize:14,fontWeight:700,color:P.purple,marginBottom:10}}>
-            Initiatives <span style={{fontWeight:400,color:P.muted,fontSize:12}}>({memberData.initiatives.length})</span>
-          </div>
-          {memberData.initiatives.length===0&&<div style={{fontSize:12.5,color:P.muted,padding:"10px 14px",background:P.surface,borderRadius:8}}>No initiatives logged.</div>}
-          {memberData.initiatives.map(init=>(
-            <Card key={init.id} style={{padding:"12px 16px",marginBottom:8,border:`1px solid ${P.purple}20`}}>
-              <div style={{fontSize:13.5,fontWeight:600,color:P.txt,marginBottom:4}}>{init.initiative}</div>
-              {init.latest_update&&(
-                <div style={{fontSize:12,color:P.muted}}>
-                  <span style={{fontSize:10.5,color:P.dim,marginRight:6}}>{init.updated_at?.slice(0,10)}</span>
-                  {init.latest_update}
-                </div>
-              )}
-            </Card>
-          ))}
-        </div>
-
-        {/* Milestones */}
-        <div>
-          <div style={{fontSize:14,fontWeight:700,color:P.amber,marginBottom:10}}>
-            Notes & Milestones <span style={{fontWeight:400,color:P.muted,fontSize:12}}>({memberData.milestones.length})</span>
-          </div>
-          {memberData.milestones.length===0&&<div style={{fontSize:12.5,color:P.muted,padding:"10px 14px",background:P.surface,borderRadius:8}}>No milestones logged.</div>}
-          {memberData.milestones.map((m,i)=>(
-            <div key={i} style={{display:"flex",gap:12,padding:"10px 14px",background:P.amberBg,
-              border:`1px solid ${P.amber}20`,borderRadius:8,marginBottom:6}}>
-              <span style={{fontSize:11.5,color:P.amber,fontWeight:600,flexShrink:0,width:90}}>{m.milestone_date||"—"}</span>
-              <div>
-                <div style={{fontSize:13,fontWeight:500,color:P.txt}}>{m.note}</div>
-                {m.project_name&&<div style={{fontSize:11.5,color:P.muted,marginTop:2}}>{m.project_name}</div>}
-              </div>
-            </div>
-          ))}
-        </div>
-      </>}
+      )}
     </div>
   );
 }
@@ -9874,12 +10008,38 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
   // Real, registered managers (have profileProp.id) get their own name/email/team
   // threaded through every live-data API call. The demo "Michael Torres" button
   // Use real profile if we have an email (IMS login), fall back to demo Michael Torres only if no email.
-  const profile=profileProp?.email?{
+  const baseProfile=profileProp?.email?{
     ...PROFILES.mgr,...profileProp,
     role:"People Manager",
     team:profileProp.team||PROFILES.mgr.team,
     initial:(profileProp.name||"M")[0].toUpperCase(),
   }:PROFILES.mgr;
+
+  // Manager alias — server-configured only (backend .env: MGR_ALIAS_MAP is a
+  // JSON map of {tester_id: {email, name}}), never a UI control. There is no
+  // input box anywhere for this: a free-text "view as any manager" field
+  // would let anyone snoop on another manager's real team data, so it's
+  // deliberately not exposed at the UI level. The lookup key is whichever
+  // identity this session actually has — the tester's own real email if
+  // logged in, or the literal id "mgr" for the anonymous demo login — so
+  // different real people (or the shared demo login) can each be mapped to
+  // a different real manager to preview, all from one .env-configured map.
+  const [mgrAlias,setMgrAlias]=useState(null);
+  useEffect(()=>{
+    const testerId = profileProp?.email || "mgr";
+    fetch(`${BACKEND}/api/config/manager-alias?as_email=${encodeURIComponent(testerId)}`).then(r=>r.json()).then(d=>{
+      setMgrAlias(d?.email ? d : null);
+    }).catch(()=>{});
+  },[profileProp?.email]);
+  // Avatar/username changes from Profile settings apply immediately (header,
+  // sidebar, everywhere `profile` is used) — no page refresh needed.
+  const [avatarOverride,setAvatarOverride]=useState(null);
+  const profile = {
+    ...(mgrAlias?.email
+      ? {...baseProfile, email:mgrAlias.email, name:mgrAlias.name||mgrAlias.email, team:mgrAlias.team||baseProfile.team}
+      : baseProfile),
+    ...(avatarOverride||{}),
+  };
 
   const sendWeeklyReminders=async()=>{
     setReminderSending(true);setReminderResult(null);
@@ -9907,7 +10067,7 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
     {v:"1",l:"Cert expiring",s:"Rachel Kim · 60 days",detail:"Analytics Pro · auto-reminder sent at 30d"},
     {v:"~34 days",l:"Avg time to autonomy",s:"18% ahead of baseline",detail:"vs 41-day historical average"},
   ];
-  const tabs=[{id:"team",label:"Team Overview",icon:PeopleGroup},{id:"members",label:"Team Members",icon:Group},{id:"certs",label:"Certifications",icon:Ribbon},{id:"projects",label:"Project Board",icon:Briefcase},{id:"tracker",label:"Team Weekly Tracker",icon:Calendar},{id:"intel",label:"AI Intelligence",icon:Lightbulb},{id:"approvals",label:"Approvals",icon:CheckmarkCircle,badge:pendingApprovals.length>0?`${pendingApprovals.length}`:null},{id:"profile",label:"Profile",icon:User}];
+  const tabs=[{id:"team",label:"Team Overview",icon:PeopleGroup},{id:"members",label:"Team Members",icon:Group},{id:"certs",label:"Certifications",icon:Ribbon},{id:"projects",label:"Project Board",icon:Briefcase},{id:"tracker",label:"Team Weekly Tracker",icon:Calendar},{id:"intel",label:"Team Intel",icon:Lightbulb},{id:"approvals",label:"Approvals",icon:CheckmarkCircle,badge:pendingApprovals.length>0?`${pendingApprovals.length}`:null},{id:"profile",label:"Profile",icon:User}];
 
   const addMemberToProject=(memberName,code)=>{
     setMemberProjects(prev=>({...prev,[memberName]:[...(prev[memberName]||[]),code]}));
@@ -9922,28 +10082,47 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
   };
 
   // Load team from employee_directory (source of truth — same as Team Members tab)
+  // Deps include profile.email/name (not []): the manager-alias lookup above
+  // resolves asynchronously and can change `profile` after first mount — every
+  // live-data fetch on this dashboard must re-run when that happens, or it
+  // silently keeps querying the pre-alias identity forever. dbMembersReqRef
+  // additionally guards against the FIRST (pre-alias) request's response
+  // arriving out of order, after the second (post-alias) one already landed —
+  // without it, a slow "your own empty team" response could silently
+  // overwrite the correct aliased team data.
+  const dbMembersReqRef=useRef(0);
   useEffect(()=>{
+    const reqId=++dbMembersReqRef.current;
     const qs=profile.email
       ?`manager_email=${encodeURIComponent(profile.email)}&manager_name=${encodeURIComponent(profile.name||"")}`
       :`manager_name=${encodeURIComponent(profile.name||"")}`;
     fetch(`${BACKEND}/api/directory/my-team?${qs}`,{credentials:"include"})
       .then(r=>r.json())
-      .then(d=>{if(d?.members)setDbMembers(d.members);})
+      .then(d=>{if(reqId===dbMembersReqRef.current&&d?.members)setDbMembers(d.members);})
       .catch(()=>{});
-  },[]);
+  },[profile.email,profile.name]);
 
   // Live aggregate numbers (real modules done, points, at-risk) — replaces static demo KPIs where available
   const [liveSummary,setLiveSummary]=useState(null);
   const [leaderboard,setLeaderboard]=useState([]);
   const [teamSkills,setTeamSkills]=useState([]); // real persisted CAT quiz results, team-wide
+  const [teamProjects,setTeamProjects]=useState([]); // real imported project rows, team-wide (Team Intel context)
+  const liveDataReqRef=useRef(0);
   useEffect(()=>{
+    const reqId=++liveDataReqRef.current;
+    const stillCurrent=()=>reqId===liveDataReqRef.current;
     fetch(`${BACKEND}/api/team/live-summary?manager=${encodeURIComponent(profile.name)}`)
-      .then(r=>r.json()).then(d=>setLiveSummary(d)).catch(()=>{});
+      .then(r=>r.json()).then(d=>{if(stillCurrent())setLiveSummary(d);}).catch(()=>{});
     fetch(`${BACKEND}/api/points/team?manager=${encodeURIComponent(profile.name)}`)
-      .then(r=>r.json()).then(d=>setLeaderboard(d?.leaderboard||[])).catch(()=>{});
+      .then(r=>r.json()).then(d=>{if(stillCurrent())setLeaderboard(d?.leaderboard||[]);}).catch(()=>{});
     fetch(`${BACKEND}/api/skills/team?manager=${encodeURIComponent(profile.name)}`)
-      .then(r=>r.json()).then(d=>setTeamSkills(d?.assessments||[])).catch(()=>{});
-  },[]);
+      .then(r=>r.json()).then(d=>{if(stillCurrent())setTeamSkills(d?.assessments||[]);}).catch(()=>{});
+    const pqs=profile.email
+      ?`manager_email=${encodeURIComponent(profile.email)}&manager_name=${encodeURIComponent(profile.name||"")}`
+      :`manager_name=${encodeURIComponent(profile.name||"")}`;
+    fetch(`${BACKEND}/api/projects/tracker-table?${pqs}`,{credentials:"include"})
+      .then(r=>r.json()).then(d=>{if(stillCurrent())setTeamProjects(d?.rows||[]);}).catch(()=>{});
+  },[profile.email,profile.name]);
 
   const refreshCapstoneSub=async(memberId)=>{
     try{
@@ -10030,10 +10209,6 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
     }catch(e){console.warn("Save failed",e);}
     setEditingAlloc(null);
   };
-  const deleteAllocationOverride=async(id)=>{
-    try{ await fetch(`${BACKEND}/api/allocations/${id}`,{method:"DELETE"}); loadTeamTracker(); }catch(e){}
-  };
-
   // Members are derived dynamically — whoever has logged at least one allocation
   const teamMemberNames=[...new Set(teamAllocations.map(a=>a.member_name))];
   const teamMemberStats=teamMemberNames.map(name=>{
@@ -10060,7 +10235,7 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
 
   return(<div style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'adobe-clean','Source Sans 3',system-ui,sans-serif",background:P.bg}}>
     <GlobalStyles/>
-    <Nav initial={profile.initial} name={profile.username||profile.name} sub={`People Manager · ${profile.team}`} color={profile.avatar_color||profile.color} avatarEmoji={profile.avatar_emoji} persona={profile.persona||"mgr"} badge="Manager" onLogout={onLogout} onToggleTheme={onToggleTheme}/>
+    <Nav initial={profile.initial} name={profile.username||profile.name} sub={`People Manager · ${profile.team}`} color={profile.avatar_color||profile.color} avatarEmoji={profile.avatar_emoji} persona={profile.persona||"mgr"} badge="Manager" onLogout={onLogout} onToggleTheme={onToggleTheme} onGoToProfile={()=>setTab("profile")}/>
     {mobile?<Tabs items={tabs} active={tab} onChange={v=>{setTab(v);setSelected(null);setShowAddMember(false);}}/>:<SideNav items={tabs} active={tab} onChange={v=>{setTab(v);setSelected(null);setShowAddMember(false);}}/>}
     <div className="nx-main-content" style={{flex:1,overflowY:"auto",paddingLeft:mobile?0:SIDENAV_WIDTH}}>
       <div style={{maxWidth:960,margin:"0 auto",padding:"24px 24px 0"}}>
@@ -10074,7 +10249,7 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
             <div style={{fontSize:13,color:P.muted}}>{dbMembers.length>0?`${dbMembers.length} direct report${dbMembers.length!==1?"s":""} from directory`:"Upload HR roster to see your team"}</div>
           </div>
           <div style={{display:"flex",gap:8,flexShrink:0}}>
-            <Btn size="sm" onClick={()=>setTab("intel")}>AI Intelligence <Ic as={ChevronRight} size={13} color="currentColor"/></Btn>
+            <Btn size="sm" onClick={()=>setTab("intel")}>Team Intel <Ic as={ChevronRight} size={13} color="currentColor"/></Btn>
             <Btn variant="secondary" size="sm" onClick={()=>setTab("skills")}>Skill Matrix</Btn>
           </div>
         </div>
@@ -10399,9 +10574,9 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
       {tab==="certs"&&<MgrCertsView setTab={setTab} managerEmail={profile.email} managerName={profile.name}/>}
 
       {tab==="projects"&&<LiveProjectBoard managerEmail={profile.email} managerName={profile.name}/>}
-      {tab==="tracker"&&<MgrTeamTrackerView profile={profile} dbMembers={dbMembers}/>}
+      {tab==="tracker"&&<MgrTeamTrackerView profile={profile}/>}
       {tab==="approvals"&&<ApprovalsTab pendingApprovals={pendingApprovals} setPendingApprovals={setPendingApprovals} profile={profile}/>}
-      {tab==="intel"&&<div style={{padding:"0 0 24px",height:"calc(100vh - 140px)",display:"flex",flexDirection:"column"}}><ManagerAgent profile={profile} groqKey={groqKey} onLog={onLog} memberProjects={memberProjects} dbMembers={dbMembers} liveSummary={liveSummary} teamSkills={teamSkills}/></div>}
+      {tab==="intel"&&<div style={{padding:"0 0 24px",height:"calc(100vh - 140px)",display:"flex",flexDirection:"column"}}><ManagerAgent profile={profile} groqKey={groqKey} onLog={onLog} dbMembers={dbMembers} liveSummary={liveSummary} teamSkills={teamSkills} teamProjects={teamProjects}/></div>}
       {tab==="profile"&&<div style={{maxWidth:640,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
         <Card style={{padding:"22px 24px"}}>
           <div style={{display:"flex",alignItems:"center",gap:18,marginBottom:20}}>
@@ -10426,7 +10601,7 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
             <span style={{fontSize:11.5,fontWeight:500,color:profile.cert.status==="Active"?P.grn:P.amber}}>{profile.cert.status}</span>
           </div>
         </Card>
-        {profile.id&&<ProfileSettingsCard email={profile.email} accountType="manager" currentUsername={profile.username} currentEmoji={profile.avatar_emoji} currentColor={profile.avatar_color} fallbackColor={profile.color}/>}
+        {profile.id&&<ProfileSettingsCard email={profile.email} accountType="manager" currentUsername={profile.username} currentEmoji={profile.avatar_emoji} currentColor={profile.avatar_color} fallbackColor={profile.color} onSaved={setAvatarOverride}/>}
       </div>}
       </div>
     </div>
@@ -10731,6 +10906,71 @@ function LangGraphStatusCard(){
   );
 }
 
+// ── UploadModeToggle — "Add & update" (merge, default) vs "Overwrite all"
+// (wipe the table clean, then import) — same two-option pattern on every
+// upload page (User Provisioning, Tracker Import, Certification Import).
+function UploadModeToggle({mode,setMode}){
+  return(
+    <div style={{display:"inline-flex",border:`1px solid ${P.border}`,borderRadius:8,overflow:"hidden",marginBottom:14}}>
+      {[["merge","Add & update"],["overwrite","Overwrite all"]].map(([v,label])=>(
+        <button key={v} onClick={()=>setMode(v)} type="button"
+          style={{padding:"7px 14px",fontSize:12.5,fontWeight:600,border:"none",cursor:"pointer",fontFamily:"inherit",
+            background:mode===v?P.blue:"transparent",color:mode===v?"#fff":P.txt}}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── DangerZoneWipe — hard-reset control, reused across admin data pages ───────
+// Requires typing DELETE (not just a browser confirm()) before the button
+// even becomes clickable, since these calls permanently drop entire tables.
+function DangerZoneWipe({title,description,endpoint,onDone}){
+  const [confirmText,setConfirmText]=useState("");
+  const [wiping,setWiping]=useState(false);
+  const [result,setResult]=useState(null);
+
+  const doWipe=async()=>{
+    if(confirmText!=="DELETE")return;
+    if(!window.confirm(`${title} — this permanently deletes everything and cannot be undone. Continue?`))return;
+    setWiping(true);setResult(null);
+    try{
+      const res=await fetch(`${BACKEND}${endpoint}?confirm=WIPE`,{method:"DELETE",credentials:"include"});
+      const d=await res.json().catch(()=>({}));
+      if(!res.ok){setResult({ok:false,error:d.detail||"Failed to delete."});}
+      else{setResult({ok:true,...d});setConfirmText("");onDone&&onDone(d);}
+    }catch(ex){setResult({ok:false,error:"Could not reach the server."});}
+    finally{setWiping(false);}
+  };
+
+  return(
+    <Card style={{padding:"18px 20px",border:`1px solid ${P.red}30`,background:P.redLt}}>
+      <div style={{fontSize:14,fontWeight:600,color:P.red,marginBottom:4}}>Danger zone — {title}</div>
+      <div style={{fontSize:12,color:P.txt,marginBottom:12}}>{description}</div>
+      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+        <input value={confirmText} onChange={e=>setConfirmText(e.target.value)}
+          placeholder="Type DELETE to confirm"
+          style={{border:`1px solid ${P.border}`,borderRadius:8,padding:"7px 11px",fontSize:13,
+            color:P.txt,background:"#fff",outline:"none",width:200,fontFamily:"inherit"}}/>
+        <button onClick={doWipe} disabled={confirmText!=="DELETE"||wiping}
+          style={{background:confirmText==="DELETE"?P.red:P.muted,color:"#fff",border:"none",borderRadius:8,
+            padding:"8px 16px",fontSize:13,fontWeight:600,
+            cursor:confirmText==="DELETE"&&!wiping?"pointer":"not-allowed",fontFamily:"inherit"}}>
+          {wiping?"Deleting…":"Delete everything"}
+        </button>
+      </div>
+      {result&&(
+        <div style={{fontSize:12,color:result.ok?P.grn:P.red,marginTop:10}}>
+          {result.ok
+            ? `✓ Deleted. ${Object.entries(result).filter(([k])=>k!=="ok").map(([k,v])=>`${k.replace(/_/g," ")}: ${v}`).join(" · ")}`
+            : `✗ ${result.error}`}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 // ── Admin: All Users table ─────────────────────────────────────────────────────
 // ── Admin: HR directory provisioning (Excel upload + audit) ──────────────────
 function DirectoryTab(){
@@ -10744,6 +10984,7 @@ function DirectoryTab(){
   const [search,setSearch]=useState("");
   const [openBatch,setOpenBatch]=useState(null);
   const [drag,setDrag]=useState(false);
+  const [mode,setMode]=useState("merge"); // merge | overwrite
   const fileRef=useRef(null);
 
   const loadDir=()=>{
@@ -10762,7 +11003,16 @@ function DirectoryTab(){
   const doUpload=async(f)=>{
     if(!f)return;
     if(!f.name.toLowerCase().endsWith(".xlsx")){setErrs(["Please choose a .xlsx file."]);setResult(null);return;}
-    setUploading(true);setResult(null);setErrs([]);
+    if(mode==="overwrite"){
+      if(!window.confirm("Overwrite mode: this deletes the entire existing HR roster before importing. Continue?"))return;
+      setUploading(true);setResult(null);setErrs([]);
+      try{
+        const wr=await fetch(`${BACKEND}/api/admin/directory/wipe?confirm=WIPE`,{method:"DELETE",credentials:"include"});
+        if(!wr.ok){setErrs(["Could not clear the existing roster — import cancelled."]);setUploading(false);return;}
+      }catch{setErrs(["Could not reach the server."]);setUploading(false);return;}
+    } else {
+      setUploading(true);setResult(null);setErrs([]);
+    }
     try{
       const fd=new FormData();fd.append("file",f);
       const r=await fetch(`${BACKEND}/api/admin/directory/upload`,{method:"POST",body:fd,credentials:"include"});
@@ -10793,7 +11043,11 @@ function DirectoryTab(){
     <div style={{maxWidth:980,margin:"0 auto",padding:"20px 24px"}}>
       <div style={{marginBottom:6}}>
         <div style={{fontSize:16,fontWeight:500,color:P.txt}}>User Provisioning</div>
-        <div style={{fontSize:12.5,color:P.muted}}>Upload the HR roster (.xlsx). Existing people are updated, new people added, and anyone missing from the file is deactivated — all changes are logged. Nothing is overwritten blindly.</div>
+        <div style={{fontSize:12.5,color:P.muted,marginBottom:10}}>
+          <b>Add & update:</b> existing people are updated, new people added, anyone missing from the file is deactivated (not deleted) — all changes are logged.<br/>
+          <b>Overwrite all:</b> the entire existing roster is permanently deleted first, then this file is imported fresh.
+        </div>
+        <UploadModeToggle mode={mode} setMode={setMode}/>
       </div>
 
       {/* Upload drop zone */}
@@ -10903,6 +11157,13 @@ function DirectoryTab(){
           )}
         </Card>
       ))}
+
+      <div style={{marginTop:20}}>
+        <DangerZoneWipe title="Wipe HR roster"
+          description="Permanently deletes every employee record, the change log, and all upload batch history. Use this for a clean-slate re-import."
+          endpoint="/api/admin/directory/wipe"
+          onDone={()=>{loadDir();loadBatches();}}/>
+      </div>
     </div>
   );
 }
@@ -11911,7 +12172,23 @@ function AdminTrackerImport(){
   const [result,setResult]     = useState(null);
   const [loading,setLoading]   = useState(false);
   const [error,setError]       = useState("");
-  const [managerEmail,setManagerEmail] = useState("");
+  const [dupeReport,setDupeReport] = useState(null);
+  const [dupeChecking,setDupeChecking] = useState(false);
+  const [dupeApplying,setDupeApplying] = useState(false);
+  const [mode,setMode] = useState("merge"); // merge | overwrite
+
+  // Persistent "what's currently imported" snapshot — loads every time this
+  // page opens, same as User Provisioning always showing the current roster,
+  // not just the outcome of whatever you happened to upload most recently.
+  const [summary,setSummary] = useState(null);
+  const [summaryLoading,setSummaryLoading] = useState(true);
+  const loadSummary = () => {
+    setSummaryLoading(true);
+    fetch(`${BACKEND}/api/admin/tracker/summary`,{credentials:"include"})
+      .then(r=>r.json()).then(d=>{setSummary(d);setSummaryLoading(false);})
+      .catch(()=>setSummaryLoading(false));
+  };
+  useEffect(()=>{ loadSummary(); },[]);
 
   function handleFile(e){
     const f=e.target.files[0];
@@ -11938,39 +12215,103 @@ function AdminTrackerImport(){
 
   async function handleImport(){
     if(!file)return;
-    if(!managerEmail.trim()){setError("Please enter the manager email before importing.");return;}
     setLoading(true); setResult(null); setError("");
+    if(mode==="overwrite"){
+      if(!window.confirm("Overwrite mode: this deletes all existing projects/tracker data before importing. Continue?")){
+        setLoading(false); return;
+      }
+      try{
+        const wr=await fetch(`${BACKEND}/api/admin/projects/wipe?confirm=WIPE`,{method:"DELETE",credentials:"include"});
+        if(!wr.ok){setError("Could not clear existing data — import cancelled."); setLoading(false); return;}
+      }catch(ex){setError("Could not reach the server."); setLoading(false); return;}
+    }
     try{
       const fd=new FormData();
       fd.append("file",file);
-      fd.append("mgr_email", managerEmail);  // send as form field too — query params can drop in multipart
-      const url=`${BACKEND}/api/admin/tracker/import?manager_email=${encodeURIComponent(managerEmail)}`;
-      const res=await fetch(url,{method:"POST",credentials:"include",body:fd});
+      // No manager email needed — each member's projects are attributed to
+      // their own manager automatically, resolved by name from the HR roster.
+      const res=await fetch(`${BACKEND}/api/admin/tracker/import`,{method:"POST",credentials:"include",body:fd});
       const d=await res.json();
       if(!res.ok){setError(d.detail||"Import failed"); return;}
-      setResult(d);
+      setResult(d); loadSummary();
     }catch(ex){setError("Import failed — check backend connection");}
     finally{setLoading(false);}
   }
 
+  async function checkDupes(){
+    setDupeChecking(true);
+    try{
+      const res=await fetch(`${BACKEND}/api/admin/projects/dedupe?dry_run=true`,{method:"POST",credentials:"include"});
+      setDupeReport(await res.json());
+    }catch(ex){}
+    finally{setDupeChecking(false);}
+  }
+  async function applyDupes(){
+    if(!window.confirm("Merge duplicate projects and links now? This cannot be undone."))return;
+    setDupeApplying(true);
+    try{
+      const res=await fetch(`${BACKEND}/api/admin/projects/dedupe?dry_run=false`,{method:"POST",credentials:"include"});
+      setDupeReport(await res.json());
+      loadSummary();
+    }catch(ex){}
+    finally{setDupeApplying(false);}
+  }
+
   const infoRows=[
-    ["Each tab","One team member's project data"],
+    ["Member column (flat sheet)","One row per project; the Member cell says who it belongs to"],
+    ["Each tab (per-member sheets)","Alternative layout — one team member's data per tab"],
     ["Project Name / ID","Creates or updates a project in the Project Board"],
     ["Hrs/Week","Stored against each member-project link"],
-    ["Health/Status","Mapped to Planning / In Progress / Blocked / Completed"],
-    ["Stage, Phase, Industry","Stored as project metadata"],
-    ["Solutions Used","Stored as project tag and detail"],
-    ["Weekly Comments","Stored as project notes"],
+    ["Health","Mapped to Planning / In Progress / Blocked / Completed"],
+    ["Stage, Phase, Industry / Vertical","Stored as project metadata"],
+    ["Solutions Used, Product Features, Data Sources, Destinations, Audiences","Stored as project detail, shown in Team Weekly Tracker"],
+    ["Product Issues (Ticket ID)","Stored as project ticket reference"],
+    ["Comments / Weekly Comments","Stored as project notes — editable per member in Team Weekly Tracker"],
+    ["High Level Project Notes","Stored as project notes"],
   ];
 
   return(
     <div style={{maxWidth:900,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:20}}>
       <div>
         <div style={{fontSize:18,fontWeight:500,color:P.txt,marginBottom:4}}>Tracker Import</div>
-        <div style={{fontSize:13,color:P.muted}}>
-          Upload your existing team project tracker (.xlsx). Each member tab is parsed and projects are created in the Project Board. Existing projects are updated, not duplicated.
+        <div style={{fontSize:13,color:P.muted,marginBottom:10}}>
+          Upload your existing team project tracker (.xlsx). Supports either a single flat sheet with a "Member" column per row, or one tab per team member (legacy layout). Each member's projects are mapped to their own manager automatically — by matching their name against the HR roster — so there's no manager email to enter.<br/>
+          <b>Add & update:</b> existing projects are matched by Project ID/title and updated; new ones are added.<br/>
+          <b>Overwrite all:</b> every existing project, link, and issue is permanently deleted first, then this file is imported fresh.
         </div>
+        <UploadModeToggle mode={mode} setMode={setMode}/>
       </div>
+
+      {/* Currently imported — persists across visits, like User Provisioning's roster */}
+      <Card style={{padding:"16px 20px"}}>
+        <div style={{fontSize:12,fontWeight:600,color:P.txt,marginBottom:10}}>Currently imported</div>
+        {summaryLoading&&<div style={{fontSize:12.5,color:P.muted}}>Loading…</div>}
+        {!summaryLoading&&summary&&summary.total_projects===0&&(
+          <div style={{fontSize:12.5,color:P.muted}}>Nothing imported yet.</div>
+        )}
+        {!summaryLoading&&summary&&summary.total_projects>0&&(
+          <>
+            <div style={{display:"flex",gap:24,marginBottom:12}}>
+              <div><div style={{fontSize:20,fontWeight:600,color:P.txt}}>{summary.total_projects}</div><div style={{fontSize:11,color:P.dim}}>Projects</div></div>
+              <div><div style={{fontSize:20,fontWeight:600,color:P.txt}}>{summary.total_members}</div><div style={{fontSize:11,color:P.dim}}>Members linked</div></div>
+              <div><div style={{fontSize:20,fontWeight:600,color:P.txt}}>{summary.by_manager.length}</div><div style={{fontSize:11,color:P.dim}}>Managers</div></div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1.6fr 0.8fr 0.8fr 1fr",gap:0,padding:"7px 0",
+              borderBottom:`1px solid ${P.border}`,fontSize:10.5,fontWeight:600,color:P.dim,textTransform:"uppercase",letterSpacing:.3}}>
+              <span>Manager</span><span style={{textAlign:"right"}}>Projects</span><span style={{textAlign:"right"}}>Members</span><span style={{textAlign:"right"}}>Last updated</span>
+            </div>
+            {summary.by_manager.map((m,i)=>(
+              <div key={m.manager_email||i} style={{display:"grid",gridTemplateColumns:"1.6fr 0.8fr 0.8fr 1fr",gap:0,
+                padding:"8px 0",borderBottom:i<summary.by_manager.length-1?`1px solid ${P.bfaint}`:"none",fontSize:12.5}}>
+                <span style={{color:P.txt}}>{m.manager_email||"unassigned"}</span>
+                <span style={{textAlign:"right",color:P.txt}}>{m.project_count}</span>
+                <span style={{textAlign:"right",color:P.txt}}>{m.member_count}</span>
+                <span style={{textAlign:"right",color:P.muted}}>{m.last_updated?m.last_updated.slice(0,10):"—"}</span>
+              </div>
+            ))}
+          </>
+        )}
+      </Card>
 
       {/* Column mapping info */}
       <Card style={{padding:"16px 20px"}}>
@@ -11984,18 +12325,8 @@ function AdminTrackerImport(){
           ))}
         </div>
         <div style={{fontSize:11.5,color:P.muted,marginTop:10,lineHeight:1.6}}>
-          System tabs (Manager Dashboard, All Projects, All Members, All Milestones, How To Use) are automatically skipped.
+          System tabs (Manager Dashboard, All Projects, All Members, All Milestones, How To Use) are automatically skipped. Member → manager mapping comes from the HR roster (Admin → User Provisioning); anyone not found there lands under "Unassigned" until the roster is uploaded.
         </div>
-      </Card>
-
-      {/* Manager email input */}
-      <Card style={{padding:"18px 20px"}}>
-        <div style={{fontSize:12,fontWeight:600,color:P.txt,marginBottom:6}}>Manager email (who owns these projects)</div>
-        <input value={managerEmail} onChange={e=>setManagerEmail(e.target.value)}
-          placeholder="e.g. lnandiwada@adobe.com"
-          style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"8px 12px",
-            fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box"}}/>
-        <div style={{fontSize:11.5,color:P.muted,marginTop:4}}>Projects will be assigned to this manager in the Project Board.</div>
       </Card>
 
       {/* File picker */}
@@ -12083,6 +12414,46 @@ function AdminTrackerImport(){
           </div>}
         </Card>
       )}
+
+      {/* Duplicate cleanup */}
+      <Card style={{padding:"18px 20px"}}>
+        <div style={{fontSize:14,fontWeight:600,color:P.txt,marginBottom:4}}>Duplicate cleanup</div>
+        <div style={{fontSize:12,color:P.muted,marginBottom:12}}>
+          If a person or project ended up linked twice (e.g. from an import before manager/email resolution
+          was fixed), check for duplicates here. Nothing is changed until you explicitly apply.
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:dupeReport?12:0}}>
+          <button onClick={checkDupes} disabled={dupeChecking}
+            style={{background:P.surface,color:P.txt,border:`1px solid ${P.border}`,borderRadius:8,
+              padding:"8px 16px",fontSize:13,cursor:dupeChecking?"wait":"pointer",fontFamily:"inherit"}}>
+            {dupeChecking?"Checking…":"Check for duplicates"}
+          </button>
+          {dupeReport&&dupeReport.dry_run&&(dupeReport.projects_merged>0||dupeReport.links_removed>0)&&(
+            <button onClick={applyDupes} disabled={dupeApplying}
+              style={{background:P.red,color:"#fff",border:"none",borderRadius:8,
+                padding:"8px 16px",fontSize:13,fontWeight:600,cursor:dupeApplying?"wait":"pointer",fontFamily:"inherit"}}>
+              {dupeApplying?"Merging…":"Merge duplicates"}
+            </button>
+          )}
+        </div>
+        {dupeReport&&(
+          <div style={{fontSize:12.5,color:P.txt,lineHeight:1.8}}>
+            {!dupeReport.dry_run&&<div style={{color:P.grn,fontWeight:600,marginBottom:6}}>✓ Applied</div>}
+            {dupeReport.projects_merged===0&&dupeReport.links_removed===0
+              ? "No duplicates found."
+              : <>
+                  {dupeReport.projects_merged>0&&<div>{dupeReport.duplicate_project_groups.length} project{dupeReport.duplicate_project_groups.length!==1?"s":""} had duplicates ({dupeReport.projects_merged} extra row{dupeReport.projects_merged!==1?"s":""} {dupeReport.dry_run?"would be":"were"} merged in).</div>}
+                  {dupeReport.links_removed>0&&<div>{dupeReport.duplicate_link_groups.length} member–project link{dupeReport.duplicate_link_groups.length!==1?"s":""} had duplicates ({dupeReport.links_removed} extra link{dupeReport.links_removed!==1?"s":""} {dupeReport.dry_run?"would be":"were"} removed).</div>}
+                </>
+            }
+          </div>
+        )}
+      </Card>
+
+      <DangerZoneWipe title="Wipe all projects & tracker data"
+        description="Permanently deletes every imported project, member link, issue, allocation, initiative, and milestone. Use this to start the tracker over from a clean slate."
+        endpoint="/api/admin/projects/wipe"
+        onDone={()=>{loadSummary();setDupeReport(null);setResult(null);}}/>
     </div>
   );
 }
@@ -12092,6 +12463,19 @@ function AdminCertsUpload(){
   const [result,setResult]=useState(null);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState("");
+  const [mode,setMode]=useState("merge"); // merge | overwrite
+
+  // Persistent snapshot — loads every time this page opens, same pattern as
+  // User Provisioning and Tracker Import.
+  const [summary,setSummary]=useState(null);
+  const [summaryLoading,setSummaryLoading]=useState(true);
+  const loadSummary=()=>{
+    setSummaryLoading(true);
+    fetch(`${BACKEND}/api/admin/certs/summary`,{credentials:"include"})
+      .then(r=>r.json()).then(d=>{setSummary(d);setSummaryLoading(false);})
+      .catch(()=>setSummaryLoading(false));
+  };
+  useEffect(()=>{ loadSummary(); },[]);
 
   function handleFile(e){
     const f=e.target.files[0];
@@ -12105,6 +12489,15 @@ function AdminCertsUpload(){
   async function handleImport(){
     if(!file)return;
     setLoading(true);setResult(null);setError("");
+    if(mode==="overwrite"){
+      if(!window.confirm("Overwrite mode: this deletes all existing certifications before importing. Continue?")){
+        setLoading(false); return;
+      }
+      try{
+        const wr=await fetch(`${BACKEND}/api/admin/certs/wipe?confirm=WIPE`,{method:"DELETE",credentials:"include"});
+        if(!wr.ok){setError("Could not clear existing certifications — import cancelled."); setLoading(false); return;}
+      }catch(ex){setError("Could not reach the server."); setLoading(false); return;}
+    }
     try{
       const fd=new FormData();
       fd.append("file",file);
@@ -12113,7 +12506,7 @@ function AdminCertsUpload(){
       });
       const d=await res.json();
       if(!res.ok){setError(d.detail||"Import failed");return;}
-      setResult(d);
+      setResult(d); loadSummary();
     }catch(ex){setError("Import failed — check backend connection");}
     finally{setLoading(false);}
   }
@@ -12122,8 +12515,35 @@ function AdminCertsUpload(){
     <div style={{maxWidth:900,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:20}}>
       <div>
         <div style={{fontSize:18,fontWeight:500,color:P.txt,marginBottom:4}}>Certification Import</div>
-        <div style={{fontSize:13,color:P.muted}}>Upload an Excel file (.xlsx) with team certification data. Existing records are updated; new ones are inserted.</div>
+        <div style={{fontSize:13,color:P.muted,marginBottom:10}}>
+          <b>Add & update:</b> existing records (matched by email + cert name) are updated; new ones inserted.<br/>
+          <b>Overwrite all:</b> every existing certification is permanently deleted first, then this file is imported fresh.
+        </div>
+        <UploadModeToggle mode={mode} setMode={setMode}/>
       </div>
+
+      {/* Currently on file — persists across visits */}
+      <Card style={{padding:"16px 20px"}}>
+        <div style={{fontSize:12,fontWeight:600,color:P.txt,marginBottom:10}}>Currently on file</div>
+        {summaryLoading&&<div style={{fontSize:12.5,color:P.muted}}>Loading…</div>}
+        {!summaryLoading&&summary&&summary.total_certs===0&&<div style={{fontSize:12.5,color:P.muted}}>No certifications on file yet.</div>}
+        {!summaryLoading&&summary&&summary.total_certs>0&&(
+          <>
+            <div style={{display:"flex",gap:24,marginBottom:summary.by_status.length?10:0}}>
+              <div><div style={{fontSize:20,fontWeight:600,color:P.txt}}>{summary.total_certs}</div><div style={{fontSize:11,color:P.dim}}>Certifications</div></div>
+              <div><div style={{fontSize:20,fontWeight:600,color:P.txt}}>{summary.total_members}</div><div style={{fontSize:11,color:P.dim}}>Members</div></div>
+            </div>
+            <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+              {summary.by_status.map(s=>(
+                <span key={s.status} style={{fontSize:12,color:P.txt,background:P.surface,borderRadius:6,padding:"3px 10px"}}>
+                  {s.status}: <b>{s.n}</b>
+                </span>
+              ))}
+            </div>
+          </>
+        )}
+      </Card>
+
       <Card style={{padding:"16px 20px",background:P.blueGh,border:`1px solid ${P.blue}20`}}>
         <div style={{fontSize:12,fontWeight:600,color:P.blue,marginBottom:8}}>Expected Excel columns</div>
         <div style={{fontSize:12,color:P.muted,lineHeight:1.9}}>
@@ -12158,6 +12578,11 @@ function AdminCertsUpload(){
           {result.inserted} inserted · {result.updated} updated · {result.skipped} skipped · {result.total} total rows processed
         </div>}
       </Card>}
+
+      <DangerZoneWipe title="Wipe all certifications"
+        description="Permanently deletes every certification record on file. Use this for a clean-slate re-import."
+        endpoint="/api/admin/certs/wipe"
+        onDone={()=>{loadSummary();setResult(null);}}/>
     </div>
   );
 }
@@ -12167,13 +12592,16 @@ function MgrCertsView({setTab,managerEmail,managerName}){
   const [teamData,setTeamData]=useState(null);
   const [expanded,setExpanded]=useState({});
   const [loading,setLoading]=useState(true);
+  const certsReqRef=useRef(0);
 
   useEffect(()=>{
+    const reqId=++certsReqRef.current;
+    setLoading(true);
     fetch(`${BACKEND}/api/certs/team?manager_email=${encodeURIComponent(managerEmail||'')}&manager_name=${encodeURIComponent(managerName||'')}`,{credentials:"include"})
       .then(r=>r.json())
-      .then(d=>{setTeamData(d.team||[]);setLoading(false);})
-      .catch(()=>setLoading(false));
-  },[]);
+      .then(d=>{if(reqId===certsReqRef.current){setTeamData(d.team||[]);setLoading(false);}})
+      .catch(()=>{if(reqId===certsReqRef.current)setLoading(false);});
+  },[managerEmail,managerName]);
 
   const allCerts=(teamData||[]).flatMap(m=>m.certs);
   const active  =allCerts.filter(c=>c.status==="Active").length;
@@ -12594,11 +13022,11 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
         <Card style={{overflow:"hidden"}}>
           <div style={{padding:"14px 20px",borderBottom:`1px solid ${P.border}`,fontSize:14,fontWeight:600,color:P.txt}}>RAG quality (RAGAS) by agent</div>
           {Object.keys(ragasSummary).length===0
-            ?<div style={{padding:20,fontSize:12.5,color:P.muted}}>No RAG-grounded generations scored yet — evaluations run automatically (in the background) whenever Curriculum, Capstone, Practice, Study Aid, or RAG retrieve real content.</div>
+            ?<div style={{padding:20,fontSize:12.5,color:P.muted}}>No RAG-grounded generations scored yet — evaluations run automatically (in the background) whenever Curriculum, Capstone, Practice, Study Aid, or RAG retrieve real content. If this stays empty even after using those agents, check the backend console for a "[ragas_eval] DISABLED" warning — scoring specifically requires OPENAI_API_KEY (Groq/Anthropic keys don't cover it).</div>
             :<div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12.5}}>
                 <thead><tr style={{textAlign:"left"}}>
-                  {["Agent","Samples","Faithfulness","Answer relevancy","Context precision","Errors"].map(h=>(
+                  {["Agent","Samples","Faithfulness","Answer relevancy","Context utilization","Errors"].map(h=>(
                     <th key={h} style={{padding:"8px 20px",color:P.dim,fontWeight:600,fontSize:11}}>{h}</th>
                   ))}
                 </tr></thead>
@@ -12609,12 +13037,15 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
                       <td style={{padding:"8px 20px",color:P.muted}}>{r.n}</td>
                       <td style={{padding:"8px 20px",color:r.avg_faithfulness>=.7?P.grn:r.avg_faithfulness>=.4?P.amber:P.red}}>{pct(r.avg_faithfulness)}</td>
                       <td style={{padding:"8px 20px",color:P.txt}}>{pct(r.avg_answer_relevancy)}</td>
-                      <td style={{padding:"8px 20px",color:P.txt}}>{pct(r.avg_context_precision)}</td>
+                      <td style={{padding:"8px 20px",color:P.txt}}>{pct(r.avg_context_utilization)}</td>
                       <td style={{padding:"8px 20px",color:r.error_count>0?P.red:P.muted}}>{r.error_count}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              <div style={{padding:"8px 20px 14px",fontSize:11,color:P.dim}}>
+                "Errors" rows have no real scores (e.g. missing OPENAI_API_KEY) — they aren't low-quality answers, they're un-scored ones. "Context utilization" is ragas's reference-free stand-in for context precision (this deployment has no human-labeled ground-truth answers to measure true precision against).
+              </div>
             </div>}
         </Card>
 
@@ -12626,7 +13057,8 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
                 <span style={{fontSize:11,fontWeight:700,color:P.purple,background:P.purpleBg,borderRadius:5,padding:"1px 8px"}}>{r.agent}</span>
                 <span style={{fontSize:12,color:r.faithfulness>=.7?P.grn:r.faithfulness>=.4?P.amber:P.red}}>Faithfulness {pct(r.faithfulness)}</span>
                 <span style={{fontSize:12,color:P.muted}}>Relevancy {pct(r.answer_relevancy)}</span>
-                <span style={{fontSize:12,color:P.muted}}>Precision {pct(r.context_precision)}</span>
+                <span style={{fontSize:12,color:P.muted}}>Utilization {pct(r.context_utilization)}</span>
+                {r.error&&<span style={{fontSize:11,color:P.red,background:P.redLt,borderRadius:5,padding:"1px 8px"}}>⚠ {r.error}</span>}
                 <span style={{marginLeft:"auto",fontSize:11,color:P.dim}}>{new Date(r.created_at).toLocaleString()}</span>
               </div>
               <div style={{fontSize:12,color:P.muted,fontStyle:"italic"}}>"{(r.query||"").slice(0,140)}"</div>

@@ -200,8 +200,30 @@ except ImportError:
         r.raise_for_status()
         return r.json()["content"][0]["text"]
 
+    def _fallback_input_guardrail(messages):
+        """Standalone reimplementation of agents.config.check_input_guardrail
+        for this fallback path — imports guardrails.policy directly rather
+        than through agents.config (which is exactly the import that failed
+        to get us into this branch), so this guardrail check can never be
+        silently skipped just because the agents/ package failed to load.
+        Returns a refusal string if blocked, else None. Never raises."""
+        try:
+            from guardrails import policy as _gr_policy
+            user_text = " ".join(m.get("content","") for m in messages if m.get("role")=="user")
+            blocked = _gr_policy.is_injection(user_text) or _gr_policy.is_unsafe(user_text)
+            if blocked:
+                return ("I can't help with that request. Let's keep this focused on your "
+                        "Adobe Experience Platform learning — what topic would you like to explore?")
+        except Exception:
+            pass  # guardrail must never break generation
+        return None
+
     def _llm_call(messages, system, max_tokens=600, timeout=30, prefer="openai"):
-        """OpenAI→Groq→Anthropic failover (mirrors agents.config.llm_call)."""
+        """OpenAI→Groq→Anthropic failover (mirrors agents.config.llm_call,
+        including the input guardrail check — see _fallback_input_guardrail)."""
+        blocked = _fallback_input_guardrail(messages)
+        if blocked:
+            return blocked
         base = ["openai","groq","anthropic"]
         order = ([prefer] + [p for p in base if p != prefer]) if prefer in base else base
         impls = {"openai": _openai_call, "groq": _groq_call, "anthropic": _anthropic_call}
@@ -1122,11 +1144,26 @@ def create_all_tables():
                 renewal               TEXT DEFAULT '',
                 region                TEXT DEFAULT '',
                 use_cases             TEXT DEFAULT '',
+                product_features      TEXT DEFAULT '',
+                data_sources          TEXT DEFAULT '',
+                destinations          TEXT DEFAULT '',
+                num_audiences         INTEGER DEFAULT 0,
+                ticket_ids            TEXT DEFAULT '',
+                days_remaining        INTEGER,
                 imported_from_tracker BOOLEAN DEFAULT FALSE,
                 is_initiative         BOOLEAN DEFAULT FALSE,
                 created_at            TIMESTAMP DEFAULT NOW(),
                 updated_at            TIMESTAMP DEFAULT NOW())""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_projects_mgr ON projects(LOWER(manager_email))")
+            # Tracker-import enrichment columns — ADD COLUMN IF NOT EXISTS so
+            # these land on startup for existing databases too (the CREATE
+            # TABLE above only takes effect for a brand-new table).
+            c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS product_features TEXT DEFAULT ''")
+            c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS data_sources TEXT DEFAULT ''")
+            c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS destinations TEXT DEFAULT ''")
+            c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS num_audiences INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS ticket_ids TEXT DEFAULT ''")
+            c.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS days_remaining INTEGER")
             c.execute("""CREATE TABLE IF NOT EXISTS project_members (
                 id              SERIAL PRIMARY KEY,
                 project_id      INTEGER REFERENCES projects(id) ON DELETE CASCADE,
@@ -1170,6 +1207,17 @@ def create_all_tables():
                 visibility TEXT DEFAULT 'Everyone',
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW())""")
+            # Append-only weekly-note history — every "Update" posts a new
+            # timestamped row instead of overwriting the previous note, so
+            # nothing a member wrote is ever silently lost.
+            c.execute("""CREATE TABLE IF NOT EXISTS project_weekly_updates (
+                id           SERIAL PRIMARY KEY,
+                project_id   INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                member_email TEXT DEFAULT '',
+                member_name  TEXT DEFAULT '',
+                update_text  TEXT NOT NULL,
+                created_at   TIMESTAMP DEFAULT NOW())""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_projupdates_project ON project_weekly_updates(project_id)")
             print("✓ All tables ready")
         conn.close()
     except Exception as e:
@@ -1205,6 +1253,33 @@ GROQ_KEY      = os.getenv("GROQ_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 DATABASE_URL  = os.getenv("DATABASE_URL", "")  # must be set in .env
+
+# Manager alias map for verification — set only in this server's own .env,
+# never user-editable or exposed as a UI control (a free-text "view as
+# anyone" box would let any user snoop on another manager's real team data).
+# MGR_ALIAS_MAP is a JSON object: {"tester_id": {"email": "...", "name": "..."}}.
+# The tester_id is whatever identity the frontend has for the person
+# currently testing — their own real email if logged in, or the literal
+# string "mgr" for the anonymous demo-manager login. Whoever is testing gets
+# redirected to view the mapped real manager's live data.
+try:
+    MGR_ALIAS_MAP = {
+        str(k).strip().lower(): v
+        for k, v in json.loads(os.getenv("MGR_ALIAS_MAP", "") or "{}").items()
+    }
+except Exception as _e:
+    print(f"⚠ MGR_ALIAS_MAP in .env is not valid JSON, ignoring: {_e}")
+    MGR_ALIAS_MAP = {}
+
+@app.get("/api/config/manager-alias")
+def get_manager_alias(as_email: str = ""):
+    """Looks up the server-configured alias map for this tester's id. Returns
+    the manager identity to view as, if this tester has a configured alias —
+    otherwise `email: None` and the caller keeps using its own identity."""
+    entry = MGR_ALIAS_MAP.get((as_email or "").strip().lower())
+    if not entry or not entry.get("email"):
+        return {"email": None}
+    return {"email": entry["email"], "name": entry.get("name")}
 
 # ── Community (threads/replies) — real backend replacing the previous
 # hardcoded NJ_THREADS/THREADS frontend arrays. Points/streak are computed live
@@ -1360,6 +1435,7 @@ import re
 import html
 import datetime as _dt
 import requests
+import threading
 
 # ── Release notes — real, parsed from each product's actual AdobeDocs release-
 # notes page (replaces the hardcoded, frozen RELEASE_NOTES frontend object).
@@ -1513,20 +1589,30 @@ def _release_notes_refresh(product: str) -> int:
 @app.get("/api/release-notes")
 def get_release_notes(product: str = None, max_age_hours: int = 24):
     """Real release notes, parsed from each product's actual Experience League
-    doc (via its AdobeDocs GitHub repo). Refetches per-product when the cache
-    is empty or older than max_age_hours — no cron needed for this app's scale."""
+    doc (via its AdobeDocs GitHub repo). Each GitHub fetch can take several
+    seconds (or time out) on networks that throttle/block raw.githubusercontent.com,
+    so this endpoint NEVER blocks the request on that: it only does a synchronous
+    refresh the very first time a product has zero cached rows (so the UI has
+    something to show), and otherwise serves whatever is cached immediately while
+    kicking off a background refresh thread for any stale product — matching the
+    same fire-and-forget pattern used for RAGAS scoring."""
     products = [product] if product else list(RELEASE_NOTES_SOURCES.keys())
     try:
         with get_db() as conn:
+            stale_products = []
             for p in products:
                 if p not in RELEASE_NOTES_SOURCES:
                     continue
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute("SELECT MAX(fetched_at) AS latest FROM release_notes_cache WHERE product=%s", (p,))
                     latest = cur.fetchone()["latest"]
-                stale = (not latest) or ((_dt.datetime.now() - latest).total_seconds() > max_age_hours * 3600)
-                if stale:
+                if not latest:
+                    # Never fetched before — block once so the UI isn't empty.
                     _release_notes_refresh(p)
+                elif (_dt.datetime.now() - latest).total_seconds() > max_age_hours * 3600:
+                    stale_products.append(p)
+            for p in stale_products:
+                threading.Thread(target=_release_notes_refresh, args=(p,), daemon=True).start()
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(f"""SELECT product, period, title, description, source_url, fetched_at
                                FROM release_notes_cache WHERE product = ANY(%s)
@@ -2053,6 +2139,27 @@ async def upload_directory(file: UploadFile = File(...),
     except Exception as e:
         # Whole transaction rolled back → directory unchanged.
         raise HTTPException(status_code=500, detail=f"Upload failed, no changes applied: {e}")
+
+
+@app.delete("/api/admin/directory/wipe")
+def wipe_directory(confirm: str = "", user: dict = Depends(require_persona("admin"))):
+    """Hard reset — permanently deletes the entire HR roster (employee_directory,
+    its change log, and upload batch history). Irreversible; requires the
+    caller to pass ?confirm=WIPE to guard against accidental calls."""
+    if confirm != "WIPE":
+        raise HTTPException(400, 'Pass ?confirm=WIPE to actually delete everything.')
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT COUNT(*) AS n FROM employee_directory")
+                n_members = c.fetchone()["n"]
+                c.execute("DELETE FROM directory_change_log")
+                c.execute("DELETE FROM employee_directory")
+                c.execute("DELETE FROM directory_upload_batches")
+    finally:
+        conn.close()
+    return {"ok": True, "deleted_members": n_members}
 
 
 @app.get("/api/admin/directory")
@@ -3151,6 +3258,12 @@ def submit_onboarding(req: OnboardingRequest):
                 cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS renewal TEXT DEFAULT ''")
                 cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS region TEXT DEFAULT ''")
                 cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS use_cases TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS product_features TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS data_sources TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS destinations TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS num_audiences INTEGER DEFAULT 0")
+                cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS ticket_ids TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS days_remaining INTEGER")
                 cur.execute("ALTER TABLE projects ADD COLUMN IF NOT EXISTS imported_from_tracker BOOLEAN DEFAULT FALSE")
                 # hrs_per_week on project_members
                 cur.execute("ALTER TABLE project_members ADD COLUMN IF NOT EXISTS hrs_per_week NUMERIC(5,1) DEFAULT 0")
@@ -5145,6 +5258,112 @@ def team_live_summary(manager: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/cohort/ranking")
+def cohort_ranking(email: str):
+    """Real peer-progress ranking for a new joiner's home page: other
+    approved learners on the same active_track, ranked by modules actually
+    completed (user_module_progress) then points (points_ledger). No
+    fictional names — only people who are actually registered and learning."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute("""SELECT name, COALESCE(active_track,'rtcdp') AS active_track
+                         FROM onboarding_requests WHERE LOWER(email)=LOWER(%s)""", (email.strip(),))
+            me = c.fetchone()
+            if not me:
+                return {"track": None, "cohort": []}
+            track = me["active_track"]
+
+            c.execute("""SELECT name, email FROM onboarding_requests
+                         WHERE COALESCE(active_track,'rtcdp')=%s AND status='approved'
+                         AND COALESCE(role,'') NOT IN ('manager','admin')""", (track,))
+            peers = c.fetchall()
+            names = [p["name"] for p in peers]
+
+            progress_by_name, points_by_name = {}, {}
+            if names:
+                c.execute("""SELECT member_name, COUNT(*) AS modules_done FROM user_module_progress
+                             WHERE track=%s AND member_name=ANY(%s) GROUP BY member_name""", (track, names))
+                progress_by_name = {r["member_name"]: r["modules_done"] for r in c.fetchall()}
+                c.execute("""SELECT member_name, SUM(points) AS total FROM points_ledger
+                             WHERE member_name=ANY(%s) GROUP BY member_name""", (names,))
+                points_by_name = {r["member_name"]: int(r["total"] or 0) for r in c.fetchall()}
+
+            board = [{
+                "name": p["name"],
+                "modules_done": progress_by_name.get(p["name"], 0),
+                "points": points_by_name.get(p["name"], 0),
+                "is_you": p["email"].strip().lower() == email.strip().lower(),
+            } for p in peers]
+            board.sort(key=lambda x: (-x["modules_done"], -x["points"], x["name"]))
+            for i, b in enumerate(board):
+                b["rank"] = i + 1
+    finally:
+        conn.close()
+    return {"track": track, "cohort": board}
+
+
+def _tenure_band(years):
+    """Buckets years-of-tenure into a small set of bands used to group
+    experienced staff into a cohort. Kept as one function so the bands are
+    defined in exactly one place."""
+    if years is None: return None
+    if years < 1: return "0-1 yr"
+    if years < 3: return "1-3 yrs"
+    if years < 5: return "3-5 yrs"
+    return "5+ yrs"
+
+
+@app.get("/api/cohort/exp-ranking")
+def cohort_exp_ranking(email: str):
+    """Real peer-progress ranking for an experienced employee's home page:
+    other approved employees on the SAME team AND in the SAME tenure band
+    (years since joining_date), ranked by modules completed then points.
+    No fictional names — only people actually registered in this team/band."""
+    from datetime import date
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute("""SELECT name, team, joining_date FROM onboarding_requests
+                         WHERE LOWER(email)=LOWER(%s)""", (email.strip(),))
+            me = c.fetchone()
+            if not me or not me["team"]:
+                return {"team": None, "tenure_band": None, "cohort": []}
+
+            my_years = (date.today() - me["joining_date"]).days / 365.25 if me["joining_date"] else None
+            my_band = _tenure_band(my_years)
+
+            c.execute("""SELECT name, email, joining_date FROM onboarding_requests
+                         WHERE team=%s AND status='approved'
+                         AND COALESCE(role,'') NOT IN ('manager','admin')""", (me["team"],))
+            peers = [p for p in c.fetchall()
+                     if _tenure_band((date.today() - p["joining_date"]).days / 365.25 if p["joining_date"] else None) == my_band]
+            names = [p["name"] for p in peers]
+
+            progress_by_name, points_by_name = {}, {}
+            if names:
+                c.execute("""SELECT member_name, COUNT(*) AS modules_done FROM user_module_progress
+                             WHERE member_name=ANY(%s) GROUP BY member_name""", (names,))
+                progress_by_name = {r["member_name"]: r["modules_done"] for r in c.fetchall()}
+                c.execute("""SELECT member_name, SUM(points) AS total FROM points_ledger
+                             WHERE member_name=ANY(%s) GROUP BY member_name""", (names,))
+                points_by_name = {r["member_name"]: int(r["total"] or 0) for r in c.fetchall()}
+
+            board = [{
+                "name": p["name"],
+                "modules_done": progress_by_name.get(p["name"], 0),
+                "points": points_by_name.get(p["name"], 0),
+                "is_you": p["email"].strip().lower() == email.strip().lower(),
+            } for p in peers]
+            board.sort(key=lambda x: (-x["modules_done"], -x["points"], x["name"]))
+            for i, b in enumerate(board):
+                b["rank"] = i + 1
+    finally:
+        conn.close()
+    return {"team": me["team"], "tenure_band": my_band, "cohort": board}
+
+
 # ── In-app notifications (replaces email for now — no SMTP dependency/cost) ───
 
 def _ensure_notification_tables():
@@ -5822,7 +6041,7 @@ def embeddings_status():
 # ── Certifications ─────────────────────────────────────────────────────────────
 
 @app.post("/api/admin/certs/import")
-async def admin_certs_import(file: UploadFile = File(...)):
+async def admin_certs_import(file: UploadFile = File(...), user: dict = Depends(require_persona("admin"))):
     """Admin uploads raw .xlsx file (ALM export format); backend parses it with openpyxl.
     Handles ALM exports where rows 1-N are metadata and the real header row contains
     'Learner Email' somewhere in the sheet."""
@@ -5949,6 +6168,41 @@ async def admin_certs_import(file: UploadFile = File(...)):
     finally:
         conn.close()
     return {"ok": True, "inserted": inserted, "updated": updated, "skipped": skipped, "total": len(rows)}
+
+
+@app.get("/api/admin/certs/summary")
+def certs_summary(user: dict = Depends(require_persona("admin"))):
+    """Persistent snapshot of certifications currently on file — shown every
+    time the Certification Import page opens, not just right after an upload."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute("SELECT COUNT(*) AS n, COUNT(DISTINCT LOWER(email)) AS members FROM user_certifications")
+            totals = c.fetchone()
+            c.execute("""SELECT status, COUNT(*) AS n FROM user_certifications
+                         GROUP BY status ORDER BY n DESC""")
+            by_status = [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
+    return {"total_certs": totals["n"], "total_members": totals["members"], "by_status": by_status}
+
+
+@app.delete("/api/admin/certs/wipe")
+def wipe_certs(confirm: str = "", user: dict = Depends(require_persona("admin"))):
+    """Hard reset — permanently deletes every certification record. Irreversible;
+    requires ?confirm=WIPE."""
+    if confirm != "WIPE":
+        raise HTTPException(400, 'Pass ?confirm=WIPE to actually delete everything.')
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT COUNT(*) AS n FROM user_certifications")
+                n = c.fetchone()["n"]
+                c.execute("DELETE FROM user_certifications")
+    finally:
+        conn.close()
+    return {"ok": True, "deleted_certs": n}
 
 
 @app.get("/api/certs/my")
@@ -6098,7 +6352,8 @@ def create_project(body: dict = Body(...)):
 
 
 @app.put("/api/projects/{project_id}")
-def update_project(project_id: int, body: dict = Body(...)):
+def update_project(project_id: int, body: dict = Body(...),
+                    user: dict = Depends(require_persona("manager", "admin"))):
     fields, params = [], []
     for col in ("title","sector","tag","sprint","status","description","color"):
         if col in body:
@@ -6118,7 +6373,7 @@ def update_project(project_id: int, body: dict = Body(...)):
 
 
 @app.delete("/api/projects/{project_id}")
-def delete_project(project_id: int):
+def delete_project(project_id: int, user: dict = Depends(require_persona("manager", "admin"))):
     conn = psycopg2.connect(DATABASE_URL)
     try:
         with conn:
@@ -6225,12 +6480,17 @@ TRACKER_SYSTEM_SHEETS = {
 }
 
 def _parse_tracker_excel(raw: bytes, manager_email: str):
-    """Parse team project tracker Excel.
-    Each non-system sheet = one team member.
+    """Parse team project tracker Excel. Supports two layouts:
+    1. Flat layout — a single sheet with a 'Member'/'Team Member'/'Resource' column;
+       each row belongs to whichever member that row's cell names.
+    2. Per-member layout (legacy) — each non-system sheet tab = one team member,
+       with the member's name taken from the tab name or a 'Name:' meta cell.
     Finds the project data table by locating the header row containing 'Project ID' or 'Project Name'.
-    Returns list of {member_name, member_role, projects:[...]} dicts.
+    Returns list of {member_name, member_role, projects:[...]} dicts. Initiatives and
+    milestones are managed separately (see member_initiatives/member_milestones) and
+    are not parsed from the Excel.
     """
-    import openpyxl, io
+    import openpyxl, io, re as _re
     from datetime import datetime, date
 
     def to_str(v):
@@ -6253,6 +6513,19 @@ def _parse_tracker_excel(raw: bytes, manager_email: str):
         try: return float(str(v).strip())
         except: return 0.0
 
+    def to_int(v):
+        try: return int(float(str(v).strip()))
+        except: return 0
+
+    def norm_header(v):
+        """Lowercase + collapse whitespace + tighten spacing around '/' so header
+        variants like 'Hrs / Week' / 'Hrs/Week' and 'Industry / Vertical' /
+        'Industry/Vertical' land on the same COL_MAP key."""
+        h = to_str(v).lower()
+        h = _re.sub(r"\s*/\s*", "/", h)
+        h = _re.sub(r"\s+", " ", h).strip()
+        return h
+
     try:
         wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, keep_vba=False)
     except Exception:
@@ -6261,22 +6534,31 @@ def _parse_tracker_excel(raw: bytes, manager_email: str):
     print(f"[tracker parser] sheets: {wb.sheetnames}")
     results = []
 
-    # Header keywords that identify the project table row
+    # Header keywords that identify the project table row / the per-row member column
     PROJ_HEADER_SIGNALS = {"project id", "project name", "project_id", "project_name"}
-    # Column name → DB field mapping
+    MEMBER_HEADER_SIGNALS = {"member", "member name", "team member", "resource",
+                              "resource name", "assigned to", "owner"}
+    # Column name (normalised) → DB field mapping
     COL_MAP = {
         "project id": "project_code", "project_name": "title", "project name": "title",
         "project type": "project_type", "industry": "industry", "industry/vertical": "industry",
         "phase": "phase", "stage": "stage",
         "start date": "start_date", "end date": "end_date",
-        "hrs/weekallocated": "hrs_per_week", "hrs / weekallocated": "hrs_per_week",
+        "days remaining": "days_remaining",
+        "hrs/weekallocated": "hrs_per_week",
         "hrs/week": "hrs_per_week", "hrs per week": "hrs_per_week",
         "allocated hours": "hrs_per_week",
         "solutions used": "solutions_used", "use cases": "use_cases",
-        "health /status": "health_status", "health/status": "health_status", "health status": "health_status",
-        "status": "health_status",
+        "product features": "product_features",
+        "data sources": "data_sources",
+        "destinations": "destinations",
+        "audiences": "num_audiences",
+        "product issues (ticket id)": "ticket_ids", "product issues": "ticket_ids",
+        "ticket id": "ticket_ids", "ticket ids": "ticket_ids",
+        "health/status": "health_status", "health status": "health_status",
+        "health": "health_status", "status": "health_status",
         "renewal?": "renewal", "renewal": "renewal",
-        "weekly comments": "weekly_comments",
+        "weekly comments": "weekly_comments", "comments": "weekly_comments",
         "high level project notes": "high_level_notes",
         "region": "region",
         "sector": "sector",
@@ -6286,61 +6568,70 @@ def _parse_tracker_excel(raw: bytes, manager_email: str):
     for sheet_name in wb.sheetnames:
         sn_lower = sheet_name.strip().lower()
         # Normalise: remove special chars for comparison
-        import re as _re
         sn_norm = _re.sub(r'[^a-z0-9 ]', '', sn_lower).strip()
-        if sn_lower in TRACKER_SYSTEM_SHEETS or sn_norm in TRACKER_SYSTEM_SHEETS:
-            continue
-        # Skip sheets whose name starts with a known system prefix
-        if any(sn_norm.startswith(s) for s in ["instruction", "how to", "dashboard", "all project",
-                                                 "all member", "all milestone", "template", "readme",
-                                                 "cover", "index", "guide", "column guide", "rules"]):
-            continue
 
         ws = wb[sheet_name]
-        member_name = sheet_name.strip()
-        member_role = ""
+        member_name_meta = sheet_name.strip()
+        member_role_meta = ""
 
-        # Scan for meta rows (Name / Role) in first 8 rows
+        # Scan for meta rows (Name / Role) in first 8 rows — used only for the
+        # legacy per-sheet-is-one-member layout.
         for row in ws.iter_rows(min_row=1, max_row=8, values_only=True):
             row_strs = [to_str(c).lower() for c in row]
             for i, cell in enumerate(row_strs):
                 if cell in ("name", "your name") and i+1 < len(row) and row[i+1]:
-                    member_name = to_str(row[i+1]) or member_name
+                    member_name_meta = to_str(row[i+1]) or member_name_meta
                 if cell in ("role", "your role") and i+1 < len(row) and row[i+1]:
-                    member_role = to_str(row[i+1])
+                    member_role_meta = to_str(row[i+1])
 
-        # Find project table header row
+        # Find project table header row, and — critically — check whether it has
+        # an explicit per-row Member/Resource column (the "flat" tracker layout).
         header_row_idx = None
         headers = []
+        member_col = None
         for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
-            row_lower = [to_str(c).lower() for c in row]
-            if any(sig in row_lower for sig in PROJ_HEADER_SIGNALS):
+            row_norm = [norm_header(c) for c in row]
+            if any(sig in row_norm for sig in PROJ_HEADER_SIGNALS):
                 header_row_idx = i
-                headers = [to_str(c).lower() for c in row]
+                headers = row_norm
+                for ci, h in enumerate(headers):
+                    if h in MEMBER_HEADER_SIGNALS:
+                        member_col = ci
+                        break
                 break
 
+        # A sheet with a genuine "Project ID"/"Project Name" header is real data
+        # regardless of what the tab is named — only apply the system-sheet-name
+        # skip when we found no such header at all (or found one with no data,
+        # in which case there's nothing to lose by skipping it).
         if header_row_idx is None:
             continue
+        is_system_name = (sn_lower in TRACKER_SYSTEM_SHEETS or sn_norm in TRACKER_SYSTEM_SHEETS or
+            any(sn_norm.startswith(s) for s in ["instruction", "how to", "dashboard",
+                "all member", "all milestone", "template", "readme",
+                "cover", "index", "guide", "column guide", "rules"]))
+        if is_system_name and member_col is None:
+            continue
 
-        projects = []
-        for row in ws.iter_rows(min_row=header_row_idx+1, values_only=True):
-            if not any(c for c in row if c is not None and str(c).strip()):
-                continue
+        def _parse_project_row(row, headers=headers):
             rec = {}
             for ci, h in enumerate(headers):
                 if h in COL_MAP and ci < len(row):
                     field = COL_MAP[h]
                     val = row[ci]
-                    if field in ("start_date","end_date"):
+                    if field in ("start_date", "end_date"):
                         rec[field] = to_date(val)
                     elif field == "hrs_per_week":
                         rec[field] = to_float(val)
+                    elif field in ("num_audiences", "days_remaining"):
+                        rec[field] = to_int(val)
                     else:
                         rec[field] = to_str(val)
-            # Skip rows with no project name
+            return rec
+
+        def _is_valid_project_row(rec):
             if not rec.get("title","").strip() and not rec.get("project_code","").strip():
-                continue
-            # Skip section-header rows and column-header rows
+                return False
             _t = (rec.get("title","") or rec.get("project_code","")).strip().lower()
             if any(sig in _t for sig in [
                 "initiative", "notes & key", "notes and key", "key milestone",
@@ -6352,102 +6643,77 @@ def _parse_tracker_excel(raw: bytes, manager_email: str):
                 "log updates, blockers", "important dates",
                 "dj nexus", "enablement dashboard",  # known initiatives — skip from projects
             ]):
-                continue
-            # Skip emoji-section-marker rows
+                return False
             import unicodedata as _ud
             _t_no_emoji = "".join(c for c in _t if _ud.category(c) not in ("So","Sm","Sk","Mn")).strip()
             if len(_t_no_emoji.replace(" ","")) < 3:
-                continue
-            # Skip if title starts with an emoji (section headers in some trackers)
+                return False
             if _t and ord(_t[0]) > 9000:
+                return False
+            return True
+
+        if member_col is not None:
+            # ── Flat layout: group rows by their own Member cell ────────────
+            by_member = {}
+            for row in ws.iter_rows(min_row=header_row_idx+1, values_only=True):
+                if not any(c for c in row if c is not None and str(c).strip()):
+                    continue
+                row_member = to_str(row[member_col]) if member_col < len(row) else ""
+                if not row_member:
+                    continue
+                rec = _parse_project_row(row)
+                if not _is_valid_project_row(rec):
+                    continue
+                if not rec.get("title",""):
+                    rec["title"] = rec.get("project_code","Unnamed project")
+                by_member.setdefault(row_member, []).append(rec)
+
+            for row_member, projs in by_member.items():
+                if projs:
+                    results.append({
+                        "member_name": row_member,
+                        "member_role": "",
+                        "email": "",
+                        "projects": projs,
+                    })
+            continue
+
+        # ── Legacy layout: whole sheet = one member ─────────────────────────
+        member_name = member_name_meta
+        member_role = member_role_meta
+        projects = []
+        for row in ws.iter_rows(min_row=header_row_idx+1, values_only=True):
+            if not any(c for c in row if c is not None and str(c).strip()):
                 continue
-            # Use project_code as title fallback
+            rec = _parse_project_row(row)
+            if not _is_valid_project_row(rec):
+                continue
             if not rec.get("title",""):
                 rec["title"] = rec.get("project_code","Unnamed project")
             projects.append(rec)
 
-        # ── Parse INITIATIVES section ─────────────────────────────────────
-        initiatives = []
-        milestones  = []
-        INIT_SIGNAL  = {"initiatives", "team-level tracking", "initiatives — team-level tracking",
-                        "initiatives - team-level tracking"}
-        MILES_SIGNAL = {"notes & key milestones", "notes and key milestones",
-                        "notes & key milestones — log updates, blockers, or important dates here",
-                        "key milestones", "milestones"}
-        in_init  = False
-        in_miles = False
-        init_date_col = init_name_col = init_upd_col = None
-        mile_date_col = mile_note_col = mile_proj_col = None
-
-        for row in ws.iter_rows(values_only=True):
-            row_strs = [to_str(c).lower() for c in row]
-            row_joined = " ".join(s for s in row_strs if s)
-
-            # Detect section headers
-            if any(sig in row_joined for sig in INIT_SIGNAL) and not any(r for r in row if r):
-                continue
-            if any(sig == row_joined.strip() for sig in INIT_SIGNAL) or                (row_strs[0] in ("📋", "📌", "") and any(sig in row_joined for sig in INIT_SIGNAL)):
-                in_init = True; in_miles = False
-                init_date_col = init_name_col = init_upd_col = None
-                continue
-            if any(sig in row_joined for sig in MILES_SIGNAL):
-                in_miles = True; in_init = False
-                mile_date_col = mile_note_col = mile_proj_col = None
-                continue
-
-            # Detect column headers within sections
-            if in_init and init_name_col is None:
-                for i, v in enumerate(row_strs):
-                    if v in ("initiative", "initiatives"): init_name_col = i
-                    if v == "date": init_date_col = i
-                    if v in ("update", "updates", "comment"): init_upd_col = i
-                if init_name_col is not None: continue
-
-            if in_miles and mile_note_col is None:
-                for i, v in enumerate(row_strs):
-                    if v in ("note", "note / milestone / update", "note/milestone/update",
-                             "note / milestone", "milestone"): mile_note_col = i
-                    if v == "date": mile_date_col = i
-                    if v in ("project name", "project"): mile_proj_col = i
-                if mile_note_col is not None: continue
-
-            # Read initiative rows
-            if in_init and init_name_col is not None:
-                if not any(c for c in row if c): in_init = False; continue
-                name_val = to_str(row[init_name_col]) if init_name_col is not None and init_name_col < len(row) else ""
-                if not name_val: continue
-                upd_val  = to_str(row[init_upd_col])  if init_upd_col  is not None and init_upd_col  < len(row) else ""
-                date_val = to_date(row[init_date_col]) if init_date_col is not None and init_date_col < len(row) else None
-                initiatives.append({"initiative": name_val, "latest_update": upd_val, "date_logged": date_val})
-
-            # Read milestone rows
-            if in_miles and mile_note_col is not None:
-                if not any(c for c in row if c): in_miles = False; continue
-                note_val = to_str(row[mile_note_col]) if mile_note_col < len(row) else ""
-                if not note_val: continue
-                date_val = to_date(row[mile_date_col]) if mile_date_col is not None and mile_date_col < len(row) else None
-                proj_val = to_str(row[mile_proj_col]) if mile_proj_col is not None and mile_proj_col < len(row) else ""
-                milestones.append({"note": note_val, "milestone_date": date_val, "project_name": proj_val})
-
-        if projects or initiatives or milestones:
+        if projects:
             results.append({
                 "member_name": member_name,
                 "member_role": member_role,
                 "email": "",
                 "projects": projects,
-                "initiatives": initiatives,
-                "milestones": milestones,
             })
 
     return results
 
 
 @app.post("/api/admin/tracker/import")
-async def import_tracker(file: UploadFile = File(...), manager_email: str = "", mgr_email: str = Form(default="")):
+async def import_tracker(file: UploadFile = File(...), manager_email: str = "", mgr_email: str = Form(default=""),
+                          user: dict = Depends(require_persona("admin"))):
+    """Admin uploads the team Excel tracker. Each member's projects are
+    attributed to THEIR OWN manager automatically, resolved by full name
+    against the HR roster (employee_directory.manager_email/manager_name) —
+    no manual manager-email entry needed. `manager_email` is only used as a
+    fallback for members not found in the HR roster (e.g. no roster uploaded
+    yet); those land under "unassigned" if it's also blank."""
     manager_email = (manager_email or mgr_email or "").strip()
-    print(f"[tracker/import] manager_email={repr(manager_email)} file={file.filename}")
-    """Admin uploads the team Excel tracker. Each member sheet is parsed,
-    projects are upserted into the projects table, and members are linked."""
+    print(f"[tracker/import] fallback manager_email={repr(manager_email)} file={file.filename}")
     import io
     contents = await file.read()
     import traceback
@@ -6475,19 +6741,39 @@ async def import_tracker(file: UploadFile = File(...), manager_email: str = "", 
                 member_name = member_data["member_name"]
                 member_role = member_data["member_role"]
 
-                # Resolve email from employee_directory by name
-                c.execute("""SELECT email FROM employee_directory
+                # Resolve a real email by name — try the HR roster first, then
+                # any registered app profile (covers demo/manual signups when
+                # no HR roster has been uploaded yet). The HR roster row also
+                # gives us who this person's manager actually is, so each
+                # member's projects get attributed to their real manager
+                # automatically — no manual "manager email" entry needed.
+                c.execute("""SELECT email, manager_email, manager_name FROM employee_directory
                              WHERE LOWER(CONCAT(first_name,' ',last_name))=LOWER(%s)
                              OR LOWER(first_name)=LOWER(%s) LIMIT 1""",
                           (member_name, member_name.split()[0] if member_name else ""))
                 dir_row = c.fetchone()
                 member_email = dir_row["email"] if dir_row else ""
+                if not member_email:
+                    c.execute("""SELECT email FROM onboarding_requests
+                                 WHERE LOWER(name)=LOWER(%s) OR LOWER(preferred_name)=LOWER(%s)
+                                 LIMIT 1""",
+                              (member_name, member_name))
+                    app_row = c.fetchone()
+                    member_email = app_row["email"] if app_row else ""
+
+                # This member's own manager — from the HR roster if we found
+                # them there, else fall back to whatever the caller passed
+                # (kept for backward compatibility), else "unassigned".
+                row_manager_email = (
+                    (dir_row and (dir_row.get("manager_email") or dir_row.get("manager_name")))
+                    or manager_email or "unassigned"
+                )
 
                 stats["members_processed"] += 1
 
                 # Clear existing allocations for this member to prevent duplicates on re-import
                 c.execute("DELETE FROM project_allocations WHERE LOWER(member_name)=LOWER(%s) AND LOWER(manager)=LOWER(%s)",
-                          (member_name, manager_email or "admin"))
+                          (member_name, row_manager_email))
 
                 for proj in member_data["projects"]:
                   def _t(v, n=250): return str(v or "")[:n]
@@ -6505,12 +6791,16 @@ async def import_tracker(file: UploadFile = File(...), manager_email: str = "", 
                     elif status_raw.lower() in ("completed","done","near completion"): status = "Completed"
                     elif status_raw.lower() in ("planning","discovery"): status = "Planning"
                     hrs = proj.get("hrs_per_week", 0) or 0
+                    days_remaining = proj.get("days_remaining")
+                    if not days_remaining and proj.get("end_date"):
+                        days_remaining = (proj["end_date"] - _date.today()).days
+                    num_audiences = proj.get("num_audiences", 0) or 0
 
                     # Upsert project (match on project_code + manager_email, or title)
                     lookup_col = "project_code" if p_code else "title"
                     lookup_val = p_code if p_code else title
                     c.execute(f"SELECT id FROM projects WHERE LOWER({lookup_col})=LOWER(%s) AND LOWER(manager_email)=LOWER(%s)",
-                              (lookup_val, manager_email or "admin"))
+                              (lookup_val, row_manager_email))
                     existing = c.fetchone()
 
                     if existing:
@@ -6520,6 +6810,8 @@ async def import_tracker(file: UploadFile = File(...), manager_email: str = "", 
                                      project_type=%s,industry=%s,solutions_used=%s,
                                      health_status=%s,weekly_comments=%s,high_level_notes=%s,
                                      renewal=%s,region=%s,use_cases=%s,
+                                     product_features=%s,data_sources=%s,destinations=%s,
+                                     num_audiences=%s,ticket_ids=%s,days_remaining=%s,
                                      start_date=%s,end_date=%s,imported_from_tracker=TRUE,updated_at=NOW()
                                      WHERE id=%s""",
                             (_t(title),_t(p_code),_t(sector),_t(tag),_t(stage),_t(phase),_t(status),
@@ -6527,20 +6819,27 @@ async def import_tracker(file: UploadFile = File(...), manager_email: str = "", 
                              _t(proj.get("solutions_used","")),_t(status_raw,50),
                              _t(proj.get("weekly_comments",""),2000),_t(proj.get("high_level_notes",""),2000),
                              _t(proj.get("renewal",""),20),_t(proj.get("region",""),50),_t(proj.get("use_cases",""),1000),
+                             _t(proj.get("product_features",""),255),_t(proj.get("data_sources",""),255),
+                             _t(proj.get("destinations",""),255),int(num_audiences),_t(proj.get("ticket_ids",""),255),
+                             days_remaining,
                              proj.get("start_date"),proj.get("end_date"),proj_id))
                         stats["projects_updated"] += 1
                     else:
                         c.execute("""INSERT INTO projects (manager_email,title,project_code,sector,tag,
                                      stage,phase,status,project_type,industry,solutions_used,
                                      health_status,weekly_comments,high_level_notes,renewal,region,use_cases,
+                                     product_features,data_sources,destinations,num_audiences,ticket_ids,days_remaining,
                                      start_date,end_date,color,imported_from_tracker)
-                                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+                                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
                                      RETURNING id""",
-                            (_t(manager_email or "admin"),_t(title),_t(p_code),_t(sector),_t(tag),_t(stage),_t(phase),_t(status),
+                            (_t(row_manager_email),_t(title),_t(p_code),_t(sector),_t(tag),_t(stage),_t(phase),_t(status),
                              _t(proj.get("project_type","")),_t(proj.get("industry","")),
                              _t(proj.get("solutions_used","")),_t(status_raw,50),
                              _t(proj.get("weekly_comments",""),2000),_t(proj.get("high_level_notes",""),2000),
                              _t(proj.get("renewal",""),20),_t(proj.get("region",""),50),_t(proj.get("use_cases",""),1000),
+                             _t(proj.get("product_features",""),255),_t(proj.get("data_sources",""),255),
+                             _t(proj.get("destinations",""),255),int(num_audiences),_t(proj.get("ticket_ids",""),255),
+                             days_remaining,
                              proj.get("start_date"),proj.get("end_date"),"#1473E6"))
                         proj_id = c.fetchone()["id"]
                         stats["projects_inserted"] += 1
@@ -6565,7 +6864,7 @@ async def import_tracker(file: UploadFile = File(...), manager_email: str = "", 
                              use_cases, solutions_used, health_status, renewal,
                              comments, project_notes, region)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (_t(member_name), _t(manager_email or "admin"),
+                        (_t(member_name), _t(row_manager_email),
                          _t(p_code or str(proj_id)), _t(title),
                          _t(proj.get("project_type","")),
                          _t(proj.get("industry","")),
@@ -6586,45 +6885,6 @@ async def import_tracker(file: UploadFile = File(...), manager_email: str = "", 
                     stats["skipped"] += 1
                     stats["errors"].append(f"{member_name}/{proj.get('title','?')}: {proj_err}")
                     print(f"[tracker/import] row error: {proj_err}")
-
-                # Insert initiatives for this member
-                # Clear old initiatives and milestones to prevent duplication on re-import
-                c.execute("DELETE FROM member_initiatives WHERE LOWER(member_name)=LOWER(%s) AND LOWER(manager_email)=LOWER(%s)",
-                          (member_name, manager_email or "admin"))
-                c.execute("DELETE FROM member_milestones WHERE LOWER(member_name)=LOWER(%s) AND LOWER(manager_email)=LOWER(%s)",
-                          (member_name, manager_email or "admin"))
-
-                # Initiatives and milestones use a separate connection so
-                # failures don't abort the project transaction
-                for init in member_data.get("initiatives", []):
-                    try:
-                        _conn2 = psycopg2.connect(DATABASE_URL)
-                        with _conn2:
-                            with _conn2.cursor() as _c:
-                                _c.execute("""INSERT INTO member_initiatives
-                                             (member_name, member_email, initiative, latest_update, date_logged, manager_email)
-                                             VALUES (%s,%s,%s,%s,%s,%s)""",
-                                    (member_name, member_email or "",
-                                     init["initiative"], init.get("latest_update",""),
-                                     init.get("date_logged"), manager_email or "admin"))
-                        _conn2.close()
-                    except Exception as _e:
-                        print(f"[tracker] initiative insert warn: {_e}")
-
-                for mile in member_data.get("milestones", []):
-                    try:
-                        _conn3 = psycopg2.connect(DATABASE_URL)
-                        with _conn3:
-                            with _conn3.cursor() as _c:
-                                _c.execute("""INSERT INTO member_milestones
-                                             (member_name, member_email, milestone_date, note, project_name, manager_email)
-                                             VALUES (%s,%s,%s,%s,%s,%s)""",
-                                    (member_name, member_email or "",
-                                     mile.get("milestone_date"), mile["note"],
-                                     mile.get("project_name",""), manager_email or "admin"))
-                        _conn3.close()
-                    except Exception as _e:
-                        print(f"[tracker] milestone insert warn: {_e}")
     finally:
         conn.close()
 
@@ -7381,23 +7641,41 @@ def my_projects(email: str = None, member_name: str = None):
 def member_update_project(project_id: int, body: dict = Body(...)):
     """Team member updates their own allocation details and project notes."""
     email = (body.get("email") or "").strip().lower()
-    if not email:
-        raise HTTPException(400, "email required")
+    member_name = (body.get("member_name") or "").strip()
+    if not email and not member_name:
+        raise HTTPException(400, "email or member_name required")
     conn = psycopg2.connect(DATABASE_URL)
     try:
         with conn:
             with conn.cursor() as c:
-                # Update member's own allocation
+                # Update member's own allocation — match by email first (the
+                # normal case), falling back to a name match for members
+                # imported from a tracker with no resolvable email (the
+                # frontend passes their display name via `email` in that case).
                 if "hrs_per_week" in body or "role_on_project" in body:
-                    c.execute("""UPDATE project_members
-                                 SET hrs_per_week=COALESCE(%s, hrs_per_week),
-                                     role_on_project=COALESCE(%s, role_on_project)
-                                 WHERE project_id=%s AND LOWER(member_email)=LOWER(%s)""",
-                              (body.get("hrs_per_week"), body.get("role_on_project"),
-                               project_id, email))
-                # Update project-level fields member is allowed to change
+                    updated = 0
+                    if email:
+                        c.execute("""UPDATE project_members
+                                     SET hrs_per_week=COALESCE(%s, hrs_per_week),
+                                         role_on_project=COALESCE(%s, role_on_project)
+                                     WHERE project_id=%s AND LOWER(member_email)=LOWER(%s)""",
+                                  (body.get("hrs_per_week"), body.get("role_on_project"),
+                                   project_id, email))
+                        updated = c.rowcount
+                    fallback_name = member_name or email
+                    if updated == 0 and fallback_name:
+                        c.execute("""UPDATE project_members
+                                     SET hrs_per_week=COALESCE(%s, hrs_per_week),
+                                         role_on_project=COALESCE(%s, role_on_project)
+                                     WHERE project_id=%s AND LOWER(member_name)=LOWER(%s)""",
+                                  (body.get("hrs_per_week"), body.get("role_on_project"),
+                                   project_id, fallback_name))
+                # Update project-level fields member is allowed to change.
+                # weekly_comments is deliberately NOT here — it's append-only
+                # history now (see /api/projects/{id}/updates), not a field
+                # any single call can silently overwrite.
                 proj_fields, proj_params = [], []
-                for col in ("weekly_comments","health_status","stage","status"):
+                for col in ("high_level_notes","health_status","stage","status"):
                     if col in body:
                         proj_fields.append(f"{col}=%s")
                         proj_params.append(body[col])
@@ -7408,6 +7686,52 @@ def member_update_project(project_id: int, body: dict = Body(...)):
     finally:
         conn.close()
     return {"ok": True}
+
+
+@app.post("/api/projects/{project_id}/updates")
+def add_project_update(project_id: int, body: dict = Body(...)):
+    """Post a new timestamped weekly note for a project — append-only, never
+    overwrites a previous entry. Also mirrors the text into
+    projects.weekly_comments as the "latest" snapshot, for views (Project
+    Board, Team Weekly Tracker table) that only show the current note."""
+    text = (body.get("update_text") or "").strip()
+    if not text:
+        raise HTTPException(400, "update_text required")
+    member_email = (body.get("member_email") or "").strip()
+    member_name  = (body.get("member_name") or "").strip()
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("""INSERT INTO project_weekly_updates (project_id,member_email,member_name,update_text)
+                             VALUES (%s,%s,%s,%s) RETURNING id, created_at""",
+                          (project_id, member_email, member_name, text))
+                row = c.fetchone()
+                c.execute("UPDATE projects SET weekly_comments=%s, updated_at=NOW() WHERE id=%s",
+                          (text, project_id))
+    finally:
+        conn.close()
+    return {"ok": True, "id": row["id"], "created_at": str(row["created_at"])}
+
+
+@app.get("/api/projects/{project_id}/updates")
+def list_project_updates(project_id: int):
+    """Full timestamped weekly-note history for one project, newest first."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute("""SELECT id, member_name, member_email, update_text, created_at
+                         FROM project_weekly_updates
+                         WHERE project_id=%s ORDER BY created_at DESC""", (project_id,))
+            rows = c.fetchall()
+    finally:
+        conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["created_at"] = str(d["created_at"])
+        result.append(d)
+    return {"updates": result}
 
 
 # ── Initiatives & Milestones ───────────────────────────────────────────────────
@@ -7585,3 +7909,186 @@ def my_client_projects(email: str = None, member_name: str = None):
             if d.get(k): d[k] = str(d[k])
         result.append(d)
     return {"projects": result}
+
+
+@app.get("/api/projects/tracker-table")
+def projects_tracker_table(manager_email: str = None, manager_name: str = None):
+    """Every imported project row, one per (project, member) pair, for every
+    member reporting to this manager — the single flat table backing Team
+    Weekly Tracker. Member→project→manager mapping falls straight out of the
+    tracker import (project_members.member_name/email + projects.manager_email),
+    no separate HR-roster upload required."""
+    if not manager_email and not manager_name:
+        raise HTTPException(400, "Provide manager_email or manager_name")
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            clauses, params = [], []
+            if manager_email:
+                clauses.append("LOWER(p.manager_email)=LOWER(%s)")
+                params.append(manager_email.strip())
+            if manager_name:
+                clauses.append("LOWER(p.manager_email)=LOWER(%s)")
+                params.append(manager_name.strip())
+            where = " OR ".join(clauses)
+            c.execute(f"""SELECT p.*, pm.member_name, pm.member_email, pm.hrs_per_week, pm.id AS member_link_id
+                          FROM project_members pm JOIN projects p ON p.id=pm.project_id
+                          WHERE ({where}) AND COALESCE(p.is_initiative,FALSE)=FALSE
+                          ORDER BY pm.member_name, p.updated_at DESC""", params)
+            rows = c.fetchall()
+    finally:
+        conn.close()
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        for k in ("created_at","updated_at","start_date","end_date"):
+            if d.get(k): d[k] = str(d[k])
+        result.append(d)
+    return {"rows": result, "total": len(result)}
+
+
+@app.get("/api/admin/tracker/summary")
+def tracker_summary():
+    """Persistent snapshot of everything currently imported — shown on the
+    Tracker Import page every time it's opened (not just right after an
+    upload), the same way User Provisioning always shows the current roster
+    regardless of when it was last uploaded."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+            c.execute("SELECT COUNT(*) AS n FROM projects WHERE COALESCE(is_initiative,FALSE)=FALSE")
+            total_projects = c.fetchone()["n"]
+            c.execute("SELECT COUNT(DISTINCT LOWER(member_email)) AS n FROM project_members")
+            total_members = c.fetchone()["n"]
+            c.execute("""SELECT p.manager_email, COUNT(DISTINCT p.id) AS project_count,
+                                COUNT(DISTINCT LOWER(pm.member_email)) AS member_count,
+                                MAX(p.updated_at) AS last_updated
+                         FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id
+                         WHERE COALESCE(p.is_initiative,FALSE)=FALSE
+                         GROUP BY p.manager_email
+                         ORDER BY project_count DESC""")
+            by_manager = []
+            for r in c.fetchall():
+                d = dict(r)
+                if d.get("last_updated"): d["last_updated"] = str(d["last_updated"])
+                by_manager.append(d)
+    finally:
+        conn.close()
+    return {"total_projects": total_projects, "total_members": total_members, "by_manager": by_manager}
+
+
+@app.delete("/api/admin/projects/wipe")
+def wipe_projects(confirm: str = "", user: dict = Depends(require_persona("admin"))):
+    """Hard reset — permanently deletes every imported project, member link,
+    issue, and the legacy allocations/initiatives/milestones tables tied to
+    tracker imports. Irreversible; requires ?confirm=WIPE."""
+    if confirm != "WIPE":
+        raise HTTPException(400, 'Pass ?confirm=WIPE to actually delete everything.')
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                c.execute("SELECT COUNT(*) AS n FROM projects")
+                n_projects = c.fetchone()["n"]
+                c.execute("SELECT COUNT(*) AS n FROM project_members")
+                n_links = c.fetchone()["n"]
+                # project_members/project_issues cascade on projects delete,
+                # but clear them explicitly first so counts above stay accurate
+                # even if a future schema change drops the ON DELETE CASCADE.
+                c.execute("DELETE FROM project_issues")
+                c.execute("DELETE FROM project_members")
+                c.execute("DELETE FROM projects")
+                c.execute("DELETE FROM project_allocations")
+                c.execute("DELETE FROM allocation_updates")
+                c.execute("DELETE FROM member_initiatives")
+                c.execute("DELETE FROM initiative_updates")
+                c.execute("DELETE FROM member_milestones")
+    finally:
+        conn.close()
+    return {"ok": True, "deleted_projects": n_projects, "deleted_links": n_links}
+
+
+@app.post("/api/admin/projects/dedupe")
+def dedupe_projects(dry_run: bool = True, user: dict = Depends(require_persona("admin"))):
+    """Cleanup for duplicate projects/links from earlier tracker imports —
+    e.g. before member-email resolution was fixed, the same person could get
+    linked to a project twice (different guessed email each time), or the
+    same client project could get created twice under slightly different
+    Project IDs. Defaults to a dry run that only reports what it *would*
+    merge; call with ?dry_run=false to actually apply.
+
+    1. Duplicate PROJECT rows: same manager_email + same title → merge into
+       the most recently updated one, re-pointing project_members/project_issues.
+    2. Duplicate LINK rows: same project_id + same member_name (different
+       member_email) → keep the most recent link, taking the max hrs_per_week.
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    report = {"dry_run": dry_run, "duplicate_project_groups": [], "duplicate_link_groups": []}
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
+                # 1) Duplicate project rows
+                c.execute("""SELECT id, manager_email, title, updated_at FROM projects
+                             WHERE COALESCE(is_initiative,FALSE)=FALSE
+                             ORDER BY LOWER(manager_email), LOWER(title), updated_at DESC NULLS LAST, id DESC""")
+                groups = {}
+                for r in c.fetchall():
+                    key = ((r["manager_email"] or "").lower(), (r["title"] or "").strip().lower())
+                    groups.setdefault(key, []).append(r["id"])
+
+                for (mgr, title), ids in groups.items():
+                    if len(ids) < 2:
+                        continue
+                    keep_id, dup_ids = ids[0], ids[1:]
+                    report["duplicate_project_groups"].append(
+                        {"manager_email": mgr, "title": title, "keep_id": keep_id, "merged_ids": dup_ids})
+                    if dry_run:
+                        continue
+                    for dup_id in dup_ids:
+                        c.execute("SELECT member_email FROM project_members WHERE project_id=%s", (dup_id,))
+                        for row in c.fetchall():
+                            c.execute("""SELECT 1 FROM project_members
+                                         WHERE project_id=%s AND LOWER(member_email)=LOWER(%s)""",
+                                      (keep_id, row["member_email"]))
+                            if c.fetchone():
+                                c.execute("DELETE FROM project_members WHERE project_id=%s AND member_email=%s",
+                                          (dup_id, row["member_email"]))
+                            else:
+                                c.execute("""UPDATE project_members SET project_id=%s
+                                             WHERE project_id=%s AND member_email=%s""",
+                                          (keep_id, dup_id, row["member_email"]))
+                        c.execute("UPDATE project_issues SET project_id=%s WHERE project_id=%s", (keep_id, dup_id))
+                        c.execute("DELETE FROM projects WHERE id=%s", (dup_id,))
+
+                # 2) Duplicate link rows (same project, same person, different email)
+                c.execute("""SELECT id, project_id, member_name, member_email, hrs_per_week
+                             FROM project_members
+                             ORDER BY project_id, LOWER(member_name), added_at DESC NULLS LAST, id DESC""")
+                groups2 = {}
+                for r in c.fetchall():
+                    key = (r["project_id"], (r["member_name"] or "").strip().lower())
+                    groups2.setdefault(key, []).append(dict(r))
+
+                for (proj_id, mname), rows2 in groups2.items():
+                    if len(rows2) < 2:
+                        continue
+                    keep, dups = rows2[0], rows2[1:]
+                    report["duplicate_link_groups"].append({
+                        "project_id": proj_id, "member_name": mname,
+                        "keep_email": keep["member_email"],
+                        "removed_emails": [d["member_email"] for d in dups],
+                    })
+                    if dry_run:
+                        continue
+                    best_hrs = max([float(keep["hrs_per_week"] or 0)] + [float(d["hrs_per_week"] or 0) for d in dups])
+                    if best_hrs > float(keep["hrs_per_week"] or 0):
+                        c.execute("UPDATE project_members SET hrs_per_week=%s WHERE id=%s", (best_hrs, keep["id"]))
+                    for d in dups:
+                        c.execute("DELETE FROM project_members WHERE id=%s", (d["id"],))
+    finally:
+        conn.close()
+
+    report["projects_merged"]  = sum(len(g["merged_ids"]) for g in report["duplicate_project_groups"])
+    report["links_removed"]    = sum(len(g["removed_emails"]) for g in report["duplicate_link_groups"])
+    return report

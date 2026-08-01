@@ -35,6 +35,7 @@ from .config import (
     GROQ_URL, GROQ_MODEL,
     groq_call, get_db_conn, make_meta,
     PRODUCT_DISTINCTIONS,
+    check_input_guardrail,
 )
 
 import os
@@ -44,6 +45,9 @@ import time
 import uuid
 import functools
 import requests
+
+from evaluation import evaluate_and_log
+from guardrails import check_output
 
 try:
     from langgraph.graph import StateGraph, END
@@ -2064,6 +2068,25 @@ def run_reasoning(question: str, context: dict = None, graph=None) -> dict:
     if not messages and question:
         messages = [{"role": "user", "content": question}]
 
+    # Input safety gate — this agent has its own tool-calling loop
+    # (_groq_call_with_tools) that never went through call_with_tools/llm_call,
+    # so it was the one agent with no injection/unsafe-content check at all.
+    # Checked here, before any model or tool call, same as every other agent.
+    blocked = check_input_guardrail(messages, agent="reasoning")
+    if blocked:
+        return {
+            "response": blocked, "intent": "blocked", "quality_ok": True,
+            "quality_score": 0, "quality_issue": None, "retries": 0,
+            "tool_calls": [], "degraded": False, "grounded": None,
+            "request_id": request_id,
+            "meta": make_meta("reasoning", REASONING_TOOL_MODEL, start, {
+                "engine": "guardrail", "steps_executed": 0, "intent": "blocked",
+                "model_chain": REASONING_MODEL_CHAIN, "model_used": "",
+                "tokens_in": 0, "tokens_out": 0, "total_tokens": 0, "est_cost_usd": 0,
+                "request_id": request_id,
+            }),
+        }
+
     state = {
         "messages":         messages,
         "profile":          context.get("profile", {}),
@@ -2110,10 +2133,46 @@ def run_reasoning(question: str, context: dict = None, graph=None) -> dict:
             s = node_reasoning_judge(s)
         final = s
 
+    raw_tool_calls = final.get("tool_calls") or []
     tool_calls = [
         {"tool": tc.get("tool", ""), "blocked": bool(tc.get("blocked"))}
-        for tc in (final.get("tool_calls") or [])
+        for tc in raw_tool_calls
     ]
+
+    # RAGAS scoring against whatever real grounding was used — the semantically
+    # pre-retrieved docs (node_retrieve_docs_semantic) plus any successful
+    # search_adobe_docs/get_module_content tool results. Fire-and-forget, only
+    # meaningful when something was actually retrieved (an off-topic/blocked/
+    # pure-reasoning turn with no grounding correctly logs nothing, same as
+    # rag.py skipping an empty run).
+    doc_contexts = [d.get("content", "") for d in (final.get("docs") or []) if isinstance(d, dict)]
+    tool_contexts = [
+        tc.get("result", "") for tc in raw_tool_calls
+        if tc.get("tool") in ("search_adobe_docs", "get_module_content")
+        and not tc.get("blocked") and tc.get("result")
+    ]
+    ragas_contexts = [c for c in (doc_contexts + tool_contexts) if c]
+    if ragas_contexts and final.get("response"):
+        try:
+            latest_q = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), question)
+            evaluate_and_log("reasoning", latest_q, final.get("response", ""), ragas_contexts)
+        except Exception:
+            pass
+
+    # Output guardrail — previously defined (guardrails/output_guardrails.py)
+    # but never called by any agent. Reasoning answers are short scaffolding
+    # questions/explanations, not cited RAG answers, so expect_citations=False;
+    # this still catches an empty/too-short/vague-refusal response that
+    # node_reasoning_judge's own heuristics don't check for. Skipped for the
+    # layer-4 hardcoded fallback text (already known-safe boilerplate used only
+    # when every LLM call failed) and left as annotate-only — this graph has no
+    # remaining retry budget by the time this runs.
+    if not final.get("degraded") and final.get("response"):
+        try:
+            verdict = check_output(final["response"], agent="reasoning", expect_citations=False, min_words=4)
+            final["response"] = verdict["answer"]
+        except Exception:
+            pass
 
     tokens_in = final.get("tokens_in", 0)
     tokens_out = final.get("tokens_out", 0)

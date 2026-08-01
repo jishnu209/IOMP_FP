@@ -5,13 +5,16 @@ Uses the real `ragas` package (not a hand-rolled re-implementation) to score
 every retrieval-grounded generation in the platform against three standard
 RAG quality metrics:
 
-  - faithfulness      : is the answer actually supported by the retrieved
-                        context, or does it say things the context doesn't
-                        back up (hallucination)?
-  - answer_relevancy  : does the answer actually address the question asked?
-  - context_precision : of the chunks retrieved, how many were relevant to
-                        the question (retrieval quality, not generation
-                        quality)?
+  - faithfulness        : is the answer actually supported by the retrieved
+                          context, or does it say things the context doesn't
+                          back up (hallucination)?
+  - answer_relevancy    : does the answer actually address the question asked?
+  - context_utilization : of the chunks retrieved, how many were actually used
+                          to support the answer (retrieval quality, not
+                          generation quality). This is ragas's reference-free
+                          stand-in for context_precision — true precision needs
+                          human-labeled ground-truth answers, which this
+                          deployment doesn't have.
 
 Applies to the main RAG agent (rag.py) AND every other agent's own retrieval
 step, wherever real retrieved context is available:
@@ -64,25 +67,45 @@ _llm = None
 _embeddings = None
 
 
+_RAGAS_UNAVAILABLE_REASON = None  # set once, printed once — see _ensure_ragas()
+
+
 def _ensure_ragas():
     """Lazily import ragas + build the shared judge LLM/embeddings once.
     Returns True if ragas is usable, False otherwise (never raises) —
-    callers degrade to a no-op rather than breaking generation."""
-    global _RAGAS_AVAILABLE, _llm, _embeddings
+    callers degrade to a no-op rather than breaking generation.
+
+    Every request that skips evaluation used to fail completely silently —
+    the only trace was a NULL-scored row in ragas_evaluations that nobody
+    was watching, easy to mistake for "the agents are scoring 0" instead of
+    "evaluation never ran at all". This now prints ONE clear, specific
+    warning the first time it's skipped (not once per request), naming
+    exactly which of the two distinct causes it is."""
+    global _RAGAS_AVAILABLE, _llm, _embeddings, _RAGAS_UNAVAILABLE_REASON
     if _RAGAS_AVAILABLE is not None:
         return _RAGAS_AVAILABLE
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        _RAGAS_AVAILABLE = False
+        _RAGAS_UNAVAILABLE_REASON = "no OPENAI_API_KEY set"
+        print(f"⚠ [ragas_eval] DISABLED — {_RAGAS_UNAVAILABLE_REASON}. "
+              f"RAG-groundedness scoring will not run for ANY agent until this is set "
+              f"(Groq/Anthropic keys don't cover this — RAGAS specifically needs OpenAI "
+              f"for its judge model + embeddings). Every evaluate_and_log() call will "
+              f"silently no-op until then.")
+        return False
     try:
         from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key:
-            _RAGAS_AVAILABLE = False
-            return False
         _llm = ChatOpenAI(model=os.getenv("RAGAS_JUDGE_MODEL", "gpt-4o-mini"),
                            api_key=api_key, temperature=0)
         _embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
         _RAGAS_AVAILABLE = True
     except Exception as e:
-        print(f"[ragas_eval] unavailable: {e}")
+        _RAGAS_UNAVAILABLE_REASON = f"import/init failure: {e}"
+        print(f"⚠ [ragas_eval] DISABLED — {_RAGAS_UNAVAILABLE_REASON}. "
+              f"OPENAI_API_KEY is set, so this is a package/dependency problem "
+              f"(check `pip show ragas langchain-openai`), not a missing-key issue. "
+              f"RAG-groundedness scoring will not run for ANY agent until this is fixed.")
         _RAGAS_AVAILABLE = False
     return _RAGAS_AVAILABLE
 
@@ -107,11 +130,28 @@ def _ensure_table():
                     contexts JSONB,
                     faithfulness REAL,
                     answer_relevancy REAL,
-                    context_precision REAL,
+                    context_utilization REAL,
                     error TEXT,
                     latency_ms INTEGER,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
+            """)
+            # Migration for existing databases: the column used to be named
+            # context_precision even though it's always held the reference-free
+            # context_utilization metric (no ground_truth labels exist in this
+            # deployment) — a confusing mismatch between the label and what was
+            # actually measured. Renamed for real instead of just documenting it.
+            c.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='ragas_evaluations' AND column_name='context_precision')
+                       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name='ragas_evaluations' AND column_name='context_utilization')
+                    THEN
+                        ALTER TABLE ragas_evaluations RENAME COLUMN context_precision TO context_utilization;
+                    END IF;
+                END $$;
             """)
         conn.close()
         _TABLE_READY = True
@@ -121,24 +161,24 @@ def _ensure_table():
 
 def evaluate_now(agent: str, query: str, answer: str, contexts: list) -> dict:
     """Synchronous RAGAS scoring — {faithfulness, answer_relevancy,
-    context_precision} each 0-1, or {"error": str} if ragas/contexts/answer
+    context_utilization} each 0-1, or {"error": str} if ragas/contexts/answer
     aren't usable. Never raises. Call evaluate_and_log() instead of this
     directly unless you specifically need to block on the result."""
     if not query or not answer or not contexts:
         return {"error": "missing query/answer/contexts"}
     if not _ensure_ragas():
-        return {"error": "ragas not configured (no OPENAI_API_KEY or import failure)"}
+        return {"error": f"ragas not configured ({_RAGAS_UNAVAILABLE_REASON})"}
     try:
         from ragas import evaluate as ragas_evaluate
         from ragas.metrics import faithfulness, answer_relevancy, context_utilization
         from datasets import Dataset
 
-        # context_precision needs a ground_truth column we don't have (no
+        # True context_precision needs a ground_truth column we don't have (no
         # human-labeled reference answers in this deployment) — context_utilization
         # is ragas's reference-free equivalent: does the retrieved context, ranked
-        # by position, actually support answering the question. Still stored under
-        # the "context_precision" column name in ragas_evaluations for a stable
-        # schema/API, since it's the same concept measured without a reference.
+        # by position, actually support answering the question. Stored under its
+        # own honest column name (context_utilization) — not relabeled as
+        # context_precision, which would measure a different thing.
         ds = Dataset.from_dict({
             "question": [query],
             "answer":   [answer],
@@ -159,9 +199,9 @@ def evaluate_now(agent: str, query: str, answer: str, contexts: list) -> dict:
                 return None
 
         return {
-            "faithfulness":      _clean(row.get("faithfulness")),
-            "answer_relevancy":  _clean(row.get("answer_relevancy")),
-            "context_precision": _clean(row.get("context_utilization")),
+            "faithfulness":        _clean(row.get("faithfulness")),
+            "answer_relevancy":    _clean(row.get("answer_relevancy")),
+            "context_utilization": _clean(row.get("context_utilization")),
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
@@ -178,13 +218,13 @@ def _log_result(agent: str, query: str, answer: str, contexts: list, scores: dic
             c.execute("""
                 INSERT INTO ragas_evaluations
                     (agent, query, answer, contexts, faithfulness, answer_relevancy,
-                     context_precision, error, latency_ms)
+                     context_utilization, error, latency_ms)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 agent, (query or "")[:2000], (answer or "")[:4000],
                 json.dumps([str(c)[:1000] for c in (contexts or [])]),
                 scores.get("faithfulness"), scores.get("answer_relevancy"),
-                scores.get("context_precision"), scores.get("error"), latency_ms,
+                scores.get("context_utilization"), scores.get("error"), latency_ms,
             ))
         conn.close()
     except Exception as e:
@@ -200,7 +240,39 @@ def evaluate_and_log(agent: str, query: str, answer: str, contexts: list):
     def _run():
         start = time.time()
         try:
-            scores = evaluate_now(agent, query, answer, contexts)
+            # Two separate asyncio issues show up when evaluate_now() (which
+            # constructs ChatOpenAI/OpenAIEmbeddings, then calls ragas's
+            # synchronous evaluate()) runs on a background thread instead of
+            # the main thread:
+            #   1. langchain_openai's client construction calls
+            #      asyncio.get_event_loop(), which only auto-creates a loop on
+            #      the MAIN thread (since Python 3.10) — a bare worker thread
+            #      raises "no current event loop" before ragas even starts.
+            #   2. ragas's own Executor.results() always wraps its actual
+            #      scoring coroutines in a fresh asyncio.run() call. If we'd
+            #      merely set-and-forget our own loop for (1), that fresh loop
+            #      and this new one are different — the OpenAI async http
+            #      client ends up bound to the first (idle) loop while ragas
+            #      awaits it from the second (running) one, which hangs
+            #      forever instead of erroring (a classic cross-event-loop
+            #      deadlock, not a timeout).
+            # Fix: give this thread a loop, patch it with nest_asyncio (ragas's
+            # own documented workaround for exactly this "already have a loop"
+            # case — see its "jupyter-like environment" branch), and run
+            # everything through THAT loop via run_until_complete so ragas's
+            # is_event_loop_running() check finds it already running and
+            # reuses it (nest_asyncio's patched reentrant run) instead of
+            # spinning up a second, disconnected loop.
+            import asyncio
+            import nest_asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            nest_asyncio.apply(loop)
+
+            async def _evaluate_async():
+                return evaluate_now(agent, query, answer, contexts)
+
+            scores = loop.run_until_complete(_evaluate_async())
         except Exception as e:
             scores = {"error": f"{type(e).__name__}: {e}"}
             traceback.print_exc()
@@ -239,7 +311,7 @@ def _flatten_context_item(item) -> list:
     dict wrapping its own list (Curriculum's get_module_topics returns
     {"module_id":..., "topics":[{...}, ...]} — without unwrapping that, the
     whole dict got dumped as one giant JSON blob instead of one string per
-    topic, which hurt context_precision/faithfulness scoring)."""
+    topic, which hurt context_utilization/faithfulness scoring)."""
     if isinstance(item, dict):
         for key in ("excerpt", "content", "objective", "title"):
             if item.get(key):
@@ -286,7 +358,7 @@ def get_evaluation_summary() -> dict:
                        COUNT(*) AS n,
                        AVG(faithfulness) AS avg_faithfulness,
                        AVG(answer_relevancy) AS avg_answer_relevancy,
-                       AVG(context_precision) AS avg_context_precision,
+                       AVG(context_utilization) AS avg_context_utilization,
                        SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS error_count
                 FROM ragas_evaluations
                 GROUP BY agent

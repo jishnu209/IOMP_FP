@@ -489,7 +489,7 @@ def check_input_guardrail(messages: list, agent: str = None):
 
 
 def llm_call(messages: list, system: str, max_tokens: int = 600, timeout: int = 30,
-             prefer: str = "openai", agent: str = None) -> str:
+             prefer: str = "openai", agent: str = None, return_provider: bool = False):
     """Provider-agnostic text completion with automatic failover.
 
     Tries the preferred provider first (OpenAI by default — the project's primary
@@ -506,10 +506,16 @@ def llm_call(messages: list, system: str, max_tokens: int = 600, timeout: int = 
 
     Raises RuntimeError only when ALL providers are unavailable/failing, with the
     underlying per-provider errors joined for debugging.
+
+    return_provider=True returns (text, provider) instead of just text, so a
+    caller building telemetry/meta can report which provider ACTUALLY answered
+    instead of assuming it was always the one requested via `prefer` — every
+    caller that hardcoded its own provider name in meta while calling this
+    function was misreporting whenever a fallback kicked in.
     """
     blocked = check_input_guardrail(messages, agent=agent)
     if blocked:
-        return blocked
+        return (blocked, "guardrail") if return_provider else blocked
 
     base = ["openai", "anthropic", "groq"]
     order = ([prefer] + [p for p in base if p != prefer]) if prefer in base else base
@@ -517,7 +523,8 @@ def llm_call(messages: list, system: str, max_tokens: int = 600, timeout: int = 
     errors = []
     for provider in order:
         try:
-            return impls[provider](messages, system, max_tokens=max_tokens, timeout=timeout, agent=agent)
+            result = impls[provider](messages, system, max_tokens=max_tokens, timeout=timeout, agent=agent)
+            return (result, provider) if return_provider else result
         except Exception as e:            # noqa: BLE001 — deliberately provider-agnostic
             errors.append(f"{provider}: {e}")
             continue
@@ -529,12 +536,15 @@ def openai_call(messages: list, system: str, max_tokens: int = 600, timeout: int
     return _openai_call(messages, system, max_tokens=max_tokens, timeout=timeout, agent=agent)
 
 
-def groq_call(messages: list, system: str, max_tokens: int = 600, timeout: int = 30, agent: str = None) -> str:
+def groq_call(messages: list, system: str, max_tokens: int = 600, timeout: int = 30, agent: str = None,
+              return_provider: bool = False):
     """Back-compat entry point for the many agents that historically called
     groq_call() directly. It now routes through the provider-agnostic dispatcher
     OpenAI-first (Groq fallback), so every existing caller is migrated to OpenAI
-    with zero changes on their side. Pass prefer= to llm_call() for other orders."""
-    return llm_call(messages, system, max_tokens=max_tokens, timeout=timeout, prefer="openai", agent=agent)
+    with zero changes on their side. Pass prefer= to llm_call() for other orders.
+    return_provider=True returns (text, provider) — see llm_call()."""
+    return llm_call(messages, system, max_tokens=max_tokens, timeout=timeout, prefer="openai", agent=agent,
+                     return_provider=return_provider)
 
 
 def parse_json_lenient(raw: str) -> dict:
