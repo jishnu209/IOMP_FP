@@ -4959,6 +4959,7 @@ def admin_ai_safety():
         UI has one endpoint instead of three round trips.
     """
     result = {"injection_blocks_by_agent": [], "ragas_summary": {}, "ragas_recent": [],
+              "ragas_thresholds": {"good": 0.7, "warn": 0.4},
               "generic_guardrail_by_agent": []}
     try:
         with get_db() as conn:
@@ -4973,9 +4974,10 @@ def admin_ai_safety():
         result["injection_blocks_error"] = str(e)
 
     try:
-        from evaluation import get_evaluation_summary, get_recent_evaluations
+        from evaluation import get_evaluation_summary, get_recent_evaluations, get_ragas_thresholds
         result["ragas_summary"] = get_evaluation_summary()
         result["ragas_recent"] = get_recent_evaluations(limit=20)
+        result["ragas_thresholds"] = get_ragas_thresholds()
     except Exception as e:
         result["ragas_error"] = str(e)
 

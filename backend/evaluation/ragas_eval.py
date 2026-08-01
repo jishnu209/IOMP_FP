@@ -66,8 +66,37 @@ _RAGAS_AVAILABLE = None  # lazy-checked on first use
 _llm = None
 _embeddings = None
 
+# ragas.metrics.{faithfulness,answer_relevancy,context_utilization} are MODULE-
+# LEVEL SINGLETONS — `from ragas.metrics import faithfulness` returns the exact
+# same object every call, in every thread. ragas.evaluate() mutates each
+# metric's `.llm` attribute in place before scoring it. Since every agent's
+# evaluate_and_log() fires its own background thread, two evaluations from
+# different requests can run concurrently and race on that shared mutable
+# state — one thread's evaluate() call reassigning/tearing down a metric's
+# `.llm` while another thread's still-in-flight async job on that SAME object
+# reads it, producing "'NoneType' object has no attribute 'generate'" instead
+# of a real score. Serializing the actual ragas_evaluate() call process-wide
+# fixes this — a few seconds of queueing during a concurrent burst is invisible
+# to users since this never blocks the request path to begin with.
+_EVAL_LOCK = threading.Lock()
+
 
 _RAGAS_UNAVAILABLE_REASON = None  # set once, printed once — see _ensure_ragas()
+
+# ── Quality thresholds ──────────────────────────────────────────────────────────
+# Applied uniformly to all three metrics (faithfulness, answer_relevancy,
+# context_utilization) — they're all 0-1 "how good is this" scores from the same
+# family of ragas judge calls, so one shared pair of bands is the right default
+# rather than inventing a separate threshold per metric with no basis for a
+# different number. Override per-deployment via .env if a specific metric
+# genuinely needs a different bar (e.g. a stricter faithfulness gate).
+# Same env-override pattern as the rest of the codebase's tunables (see
+# agents/config.py's QUIZ_CONFIDENCE_PASS etc.) — never hardcoded.
+def get_ragas_thresholds() -> dict:
+    return {
+        "good": float(os.getenv("RAGAS_GOOD_THRESHOLD", "0.7")),
+        "warn": float(os.getenv("RAGAS_WARN_THRESHOLD", "0.4")),
+    }
 
 
 def _ensure_ragas():
@@ -184,10 +213,11 @@ def evaluate_now(agent: str, query: str, answer: str, contexts: list) -> dict:
             "answer":   [answer],
             "contexts": [[str(c) for c in contexts if c]],
         })
-        result = ragas_evaluate(
-            ds, metrics=[faithfulness, answer_relevancy, context_utilization],
-            llm=_llm, embeddings=_embeddings,
-        )
+        with _EVAL_LOCK:
+            result = ragas_evaluate(
+                ds, metrics=[faithfulness, answer_relevancy, context_utilization],
+                llm=_llm, embeddings=_embeddings,
+            )
         df = result.to_pandas()
         row = df.iloc[0]
 
@@ -346,10 +376,16 @@ def extract_tool_contexts(tool_calls: list, tool_names: set) -> list:
 
 def get_evaluation_summary() -> dict:
     """Per-agent average scores + sample count — for the Admin AI Safety
-    summary cards. Returns {} if the table doesn't exist yet (no evals run)."""
+    summary cards. Returns {} if the table doesn't exist yet (no evals run).
+
+    Also includes below_threshold: how many SCORED (non-error) rows had any
+    of the three metrics fall below the "warn" band from get_ragas_thresholds()
+    — a concrete, actionable count distinct from error_count (which means
+    "never scored", not "scored poorly")."""
     _ensure_table()
     if psycopg2 is None:
         return {}
+    warn = get_ragas_thresholds()["warn"]
     try:
         conn = psycopg2.connect(_get_db_url())
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as c:
@@ -359,11 +395,14 @@ def get_evaluation_summary() -> dict:
                        AVG(faithfulness) AS avg_faithfulness,
                        AVG(answer_relevancy) AS avg_answer_relevancy,
                        AVG(context_utilization) AS avg_context_utilization,
-                       SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS error_count
+                       SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) AS error_count,
+                       SUM(CASE WHEN error IS NULL AND (
+                               faithfulness < %s OR answer_relevancy < %s OR context_utilization < %s
+                           ) THEN 1 ELSE 0 END) AS below_threshold
                 FROM ragas_evaluations
                 GROUP BY agent
                 ORDER BY agent
-            """)
+            """, (warn, warn, warn))
             rows = [dict(r) for r in c.fetchall()]
         conn.close()
         return {r["agent"]: r for r in rows}

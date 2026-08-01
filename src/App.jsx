@@ -12986,6 +12986,11 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
         const blocks=aiSafety?.injection_blocks_by_agent||[];
         const genericScores=aiSafety?.generic_guardrail_by_agent||[];
         const pct=v=>v==null?"—":`${Math.round(v*100)}%`;
+        // Server-configured thresholds (RAGAS_GOOD_THRESHOLD/RAGAS_WARN_THRESHOLD
+        // in backend .env) — read from the API instead of hardcoding here, so the
+        // UI can never drift out of sync with what the backend actually uses.
+        const ragasT=aiSafety?.ragas_thresholds||{good:0.7,warn:0.4};
+        const ragasColor=v=>v==null?P.muted:v>=ragasT.good?P.grn:v>=ragasT.warn?P.amber:P.red;
         return(
         <div style={{maxWidth:960,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:20}}>
         <div>
@@ -13026,7 +13031,7 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
             :<div style={{overflowX:"auto"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12.5}}>
                 <thead><tr style={{textAlign:"left"}}>
-                  {["Agent","Samples","Faithfulness","Answer relevancy","Context utilization","Errors"].map(h=>(
+                  {["Agent","Samples","Faithfulness","Answer relevancy","Context utilization","Below threshold","Errors"].map(h=>(
                     <th key={h} style={{padding:"8px 20px",color:P.dim,fontWeight:600,fontSize:11}}>{h}</th>
                   ))}
                 </tr></thead>
@@ -13035,16 +13040,17 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
                     <tr key={r.agent} style={{borderTop:`1px solid ${P.bfaint}`}}>
                       <td style={{padding:"8px 20px",fontWeight:600,color:P.txt}}>{r.agent}</td>
                       <td style={{padding:"8px 20px",color:P.muted}}>{r.n}</td>
-                      <td style={{padding:"8px 20px",color:r.avg_faithfulness>=.7?P.grn:r.avg_faithfulness>=.4?P.amber:P.red}}>{pct(r.avg_faithfulness)}</td>
-                      <td style={{padding:"8px 20px",color:P.txt}}>{pct(r.avg_answer_relevancy)}</td>
-                      <td style={{padding:"8px 20px",color:P.txt}}>{pct(r.avg_context_utilization)}</td>
+                      <td style={{padding:"8px 20px",color:ragasColor(r.avg_faithfulness)}}>{pct(r.avg_faithfulness)}</td>
+                      <td style={{padding:"8px 20px",color:ragasColor(r.avg_answer_relevancy)}}>{pct(r.avg_answer_relevancy)}</td>
+                      <td style={{padding:"8px 20px",color:ragasColor(r.avg_context_utilization)}}>{pct(r.avg_context_utilization)}</td>
+                      <td style={{padding:"8px 20px",color:r.below_threshold>0?P.amber:P.muted}}>{r.below_threshold??"—"}</td>
                       <td style={{padding:"8px 20px",color:r.error_count>0?P.red:P.muted}}>{r.error_count}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
               <div style={{padding:"8px 20px 14px",fontSize:11,color:P.dim}}>
-                "Errors" rows have no real scores (e.g. missing OPENAI_API_KEY) — they aren't low-quality answers, they're un-scored ones. "Context utilization" is ragas's reference-free stand-in for context precision (this deployment has no human-labeled ground-truth answers to measure true precision against).
+                "Errors" rows have no real scores (e.g. missing OPENAI_API_KEY) — they aren't low-quality answers, they're un-scored ones. "Below threshold" counts real (scored) rows where any metric fell below {pct(ragasT.warn)} — the amber/red bands below {pct(ragasT.good)}/{pct(ragasT.warn)} are configurable via RAGAS_GOOD_THRESHOLD/RAGAS_WARN_THRESHOLD in the backend .env. "Context utilization" is ragas's reference-free stand-in for context precision (this deployment has no human-labeled ground-truth answers to measure true precision against).
               </div>
             </div>}
         </Card>
@@ -13055,9 +13061,9 @@ function AdminDash({onLogout,groqKey,setGroqKey,githubToken,setGithubToken,callL
             <div key={r.id} style={{padding:"12px 20px",borderBottom:`1px solid ${P.bfaint}`}}>
               <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
                 <span style={{fontSize:11,fontWeight:700,color:P.purple,background:P.purpleBg,borderRadius:5,padding:"1px 8px"}}>{r.agent}</span>
-                <span style={{fontSize:12,color:r.faithfulness>=.7?P.grn:r.faithfulness>=.4?P.amber:P.red}}>Faithfulness {pct(r.faithfulness)}</span>
-                <span style={{fontSize:12,color:P.muted}}>Relevancy {pct(r.answer_relevancy)}</span>
-                <span style={{fontSize:12,color:P.muted}}>Utilization {pct(r.context_utilization)}</span>
+                <span style={{fontSize:12,color:ragasColor(r.faithfulness)}}>Faithfulness {pct(r.faithfulness)}</span>
+                <span style={{fontSize:12,color:ragasColor(r.answer_relevancy)}}>Relevancy {pct(r.answer_relevancy)}</span>
+                <span style={{fontSize:12,color:ragasColor(r.context_utilization)}}>Utilization {pct(r.context_utilization)}</span>
                 {r.error&&<span style={{fontSize:11,color:P.red,background:P.redLt,borderRadius:5,padding:"1px 8px"}}>⚠ {r.error}</span>}
                 <span style={{marginLeft:"auto",fontSize:11,color:P.dim}}>{new Date(r.created_at).toLocaleString()}</span>
               </div>
