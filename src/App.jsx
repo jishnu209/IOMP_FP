@@ -1215,8 +1215,9 @@ function NavBell({memberName}){
           </div>
           {items.length===0&&<div style={{padding:"24px 14px",textAlign:"center",fontSize:12.5,color:P.muted}}>You're all caught up.</div>}
           {items.map(n=>(
-            <div key={n.id} onClick={()=>!n.is_read&&markRead(n.id)}
-              style={{display:"flex",gap:10,padding:"10px 14px",borderBottom:`1px solid ${P.bfaint}`,cursor:n.is_read?"default":"pointer",background:n.is_read?"transparent":P.blueGh}}>
+            <div key={n.id} onClick={()=>{ if(!n.is_read)markRead(n.id);
+                if(["mention","reply","kudos","public_post"].includes(n.type)){ setOpen(false); window.dispatchEvent(new CustomEvent("nexus:navigate",{detail:{tab:"community",thread_id:n.thread_id}})); } }}
+              style={{display:"flex",gap:10,padding:"10px 14px",borderBottom:`1px solid ${P.bfaint}`,cursor:"pointer",background:n.is_read?"transparent":P.blueGh}}>
               <span style={{fontSize:16,flexShrink:0,lineHeight:1.3}}>{emoji[n.type]||"🔔"}</span>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:12.5,fontWeight:n.is_read?400:600,color:P.txt,marginBottom:1}}>{n.title}</div>
@@ -2035,6 +2036,22 @@ function Community({profile,userName:userNameProp}){
       loadStats();loadLeaderboard();
     }catch{ loadThreads(); }
   };
+  const [editId,setEditId]=useState(null),[editTitle,setEditTitle]=useState(""),[editBody,setEditBody]=useState("");
+  const startEdit=(t)=>{setEditId(t.id);setEditTitle(t.title||"");setEditBody(t.body||"");setOpen(null);};
+  const saveEdit=async()=>{
+    if(!editTitle.trim())return;
+    try{
+      await fetch(`${BACKEND}/api/community/threads/${editId}`,{method:"PUT",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({editor_name:userName,title:editTitle.trim(),body:editBody.trim()})});
+      setEditId(null);loadThreads();
+    }catch{}
+  };
+  const deletePost=async(t)=>{
+    if(!window.confirm("Delete this post? This can't be undone."))return;
+    setThreads(prev=>prev.filter(x=>x.id!==t.id));
+    try{ await fetch(`${BACKEND}/api/community/threads/${t.id}?editor_name=${encodeURIComponent(userName)}`,{method:"DELETE"}); loadStats();loadLeaderboard(); }
+    catch{ loadThreads(); }
+  };
 
   return(<div style={{padding:"20px 24px",maxWidth:760,margin:"0 auto"}}>
     {/* Points strip */}
@@ -2156,6 +2173,17 @@ function Community({profile,userName:userNameProp}){
     {visible.length===0&&<div style={{padding:"28px 0",textAlign:"center",color:P.muted,fontSize:13}}>No posts yet in this category — be the first!</div>}
     {visible.map(t=>(
       <Card key={t.id} style={{marginBottom:10}}>
+        {editId===t.id?(
+          <div style={{padding:"14px 16px"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:12,fontWeight:600,color:P.txt,marginBottom:8}}>Edit post</div>
+            <input value={editTitle} onChange={e=>setEditTitle(e.target.value)} style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"8px 12px",fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:8}}/>
+            <textarea value={editBody} onChange={e=>setEditBody(e.target.value)} rows={3} placeholder="Details (optional)…" style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"8px 12px",fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit",resize:"vertical",marginBottom:10}}/>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={saveEdit} disabled={!editTitle.trim()} style={{background:editTitle.trim()?P.blue:"#aaa",color:"#fff",border:"none",borderRadius:8,padding:"7px 16px",fontSize:12.5,fontWeight:600,cursor:editTitle.trim()?"pointer":"not-allowed",fontFamily:"inherit"}}>Save</button>
+              <button onClick={()=>setEditId(null)} style={{background:"transparent",border:`1px solid ${P.border}`,borderRadius:8,padding:"7px 12px",fontSize:12.5,color:P.muted,cursor:"pointer",fontFamily:"inherit"}}>Cancel</button>
+            </div>
+          </div>
+        ):(<>
         <div onClick={()=>setOpen(open===t.id?null:t.id)} style={{padding:"13px 16px",cursor:"pointer",display:"flex",alignItems:"flex-start",gap:12}}>
           <Avatar src={`https://i.pravatar.cc/96?u=${encodeURIComponent(t.author||String(t.id))}`} alt={t.author} size={32}/>
           <div style={{flex:1,minWidth:0}}>
@@ -2170,6 +2198,10 @@ function Community({profile,userName:userNameProp}){
               <span style={{fontSize:11,color:P.dim}}>{t.author}</span>
               <span style={{fontSize:11,color:P.dim}}>· {t.replies.length} replies</span>
               <span style={{fontSize:11,color:P.dim}}>· {t.time}</span>
+              {t.author===userName&&<>
+                <button onClick={e=>{e.stopPropagation();startEdit(t);}} style={{fontSize:11,color:P.blue,background:"transparent",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>· Edit</button>
+                <button onClick={e=>{e.stopPropagation();deletePost(t);}} style={{fontSize:11,color:P.red,background:"transparent",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>· Delete</button>
+              </>}
             </div>
           </div>
           <button onClick={e=>{e.stopPropagation();toggleKudos(t);}} title={t.reacted?"Remove kudos":"Give kudos"}
@@ -2196,6 +2228,7 @@ function Community({profile,userName:userNameProp}){
             <button onClick={()=>handleReply(t.id,replyText[t.id])} style={{background:`linear-gradient(135deg,${P.blue},${P.blueDk})`,color:"#fff",border:"none",borderRadius:7,padding:"7px 16px",fontSize:12.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Reply</button>
           </div>
         </div>}
+        </>)}
       </Card>
     ))}
   </div>);
@@ -4630,7 +4663,7 @@ function computeEffectiveModules(modules,completedIds){
 // Inspired by Duolingo / BYJU's: big round level nodes snaking down a curved road,
 // completed = green with a check, current = pulsing "you are here", locked = grey.
 // Click a node to open its topics. HTML nodes over one SVG road (no innerHTML).
-function LearningFlowMap({modules=[],profile=null,onOpenLesson=null}){
+function LearningFlowMap({modules=[],profile=null,demo=false,onOpenLesson=null}){
   // Default the detail panel to the current (active) phase so the view isn't
   // empty — falls back to the first module if nothing is active yet.
   const [sel,setSel]=useState(()=>{const a=modules.findIndex(m=>m.status==="active");return a>=0?a:(modules.length?0:null);});
@@ -4692,6 +4725,7 @@ function LearningFlowMap({modules=[],profile=null,onOpenLesson=null}){
       {/* header + progress */}
       <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:8,flexWrap:"wrap"}}>
         <div style={{fontSize:17,fontWeight:600,color:P.txt}}>Your journey</div>
+        {demo&&<span title="This is illustrative demo progress. Sign in with your Adobe account to see your real completions." style={{fontSize:9.5,fontWeight:700,letterSpacing:.4,color:P.amber,background:P.amberBg,border:`1px solid ${P.amber}40`,borderRadius:4,padding:"1px 6px",textTransform:"uppercase"}}>Sample data</span>}
         <div style={{flex:1,minWidth:120,height:9,background:P.bfaint,borderRadius:99,overflow:"hidden",maxWidth:280}}>
           <div style={{width:`${n?Math.round(doneCount/n*100):0}%`,height:"100%",background:`linear-gradient(90deg,${DONE},#7bc23e)`,borderRadius:99,transition:"width .7s cubic-bezier(.2,1,.3,1)"}}/>
         </div>
@@ -4996,7 +5030,7 @@ ONLY refer to the modules listed above. Never invent module names. Keep your ans
       {/* ── Flow map ── */}
       {sub==="flow"&&<div style={{flex:1,overflowY:"auto",padding:"clamp(14px,2vw,28px)"}}>
         <div style={{width:"100%"}}>
-          <LearningFlowMap modules={effectiveModules} profile={p} onOpenLesson={onOpenLesson}/>
+          <LearningFlowMap modules={effectiveModules} profile={p} demo={!hasRealProgress} onOpenLesson={onOpenLesson}/>
         </div>
       </div>}
 
@@ -6880,6 +6914,7 @@ function CohortCard({profile,endpoint,subtitle}){
 
 function NJDash({onLogout,groqKey,onLog,onJudge,profile,githubToken,onToggleTheme}){
   const [tab,setTab]=useState("overview");
+  useEffect(()=>{const h=e=>{const tb=e.detail?.tab;if(tb)setTab(tb);};window.addEventListener("nexus:navigate",h);return()=>window.removeEventListener("nexus:navigate",h);},[]);
   const [studyModule,setStudyModule]=useState(null);
   const [expandedModule,setExpandedModule]=useState(null);
   const [lessonModule,setLessonModule]=useState(null);
@@ -7272,6 +7307,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
   const [quizzing,setQuizzing]=useState(false); // loading state for quiz gen
   const [quizData,setQuizData]=useState(null);  // {skill, questions, answers}
   const [tab,setTab]=useState("home");
+  useEffect(()=>{const h=e=>{const tb=e.detail?.tab;if(tb)setTab(tb);};window.addEventListener("nexus:navigate",h);return()=>window.removeEventListener("nexus:navigate",h);},[]);
   const [expandedModule,setExpandedModule]=useState(null);
   const [studyModule,setStudyModule]=useState(null);
   const [lessonModule,setLessonModule]=useState(null);
@@ -10258,6 +10294,7 @@ function TeamMembersTab({managerName, managerEmail, setTab}){
 
 function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setMemberProjects,projectIssues,setProjectIssues,onToggleTheme,pendingApprovals=[],setPendingApprovals}){
   const [tab,setTab]=useState("team");
+  useEffect(()=>{const h=e=>{const tb=e.detail?.tab;if(tb)setTab(tb);};window.addEventListener("nexus:navigate",h);return()=>window.removeEventListener("nexus:navigate",h);},[]);
   const [selected,setSelected]=useState(null);
   const [playbook,setPlaybook]=useState(false);
   const [activeProj,setActiveProj]=useState(ALL_PROJECTS[0].code);
@@ -10343,7 +10380,7 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
     {v:"1",l:"Cert expiring",s:"Rachel Kim · 60 days",detail:"Analytics Pro · auto-reminder sent at 30d"},
     {v:"~34 days",l:"Avg time to autonomy",s:"18% ahead of baseline",detail:"vs 41-day historical average"},
   ];
-  const tabs=[{id:"team",label:"Team Overview",icon:PeopleGroup},{id:"members",label:"Team Members",icon:Group},{id:"certs",label:"Certifications",icon:Ribbon},{id:"projects",label:"Project Board",icon:Briefcase},{id:"tracker",label:"Team Weekly Tracker",icon:Calendar},{id:"intel",label:"Team Intel",icon:Lightbulb},{id:"approvals",label:"Approvals",icon:CheckmarkCircle,badge:pendingApprovals.length>0?`${pendingApprovals.length}`:null},{id:"profile",label:"Profile",icon:User}];
+  const tabs=[{id:"team",label:"Team Overview",icon:PeopleGroup},{id:"members",label:"Team Members",icon:Group},{id:"certs",label:"Certifications",icon:Ribbon},{id:"projects",label:"Project Board",icon:Briefcase},{id:"tracker",label:"Team Weekly Tracker",icon:Calendar},{id:"intel",label:"Team Intel",icon:Lightbulb},{id:"community",label:"Community",icon:CommunityIcon},{id:"approvals",label:"Approvals",icon:CheckmarkCircle,badge:pendingApprovals.length>0?`${pendingApprovals.length}`:null},{id:"profile",label:"Profile",icon:User}];
 
   const addMemberToProject=(memberName,code)=>{
     setMemberProjects(prev=>({...prev,[memberName]:[...(prev[memberName]||[]),code]}));
@@ -10853,6 +10890,9 @@ function MGRDash({onLogout,groqKey,onLog,profile:profileProp,memberProjects,setM
       {tab==="tracker"&&<MgrTeamTrackerView profile={profile}/>}
       {tab==="approvals"&&<ApprovalsTab pendingApprovals={pendingApprovals} setPendingApprovals={setPendingApprovals} profile={profile}/>}
       {tab==="intel"&&<div style={{padding:"0 0 24px",height:"calc(100vh - 140px)",display:"flex",flexDirection:"column"}}><ManagerAgent profile={profile} groqKey={groqKey} onLog={onLog} dbMembers={dbMembers} liveSummary={liveSummary} teamSkills={teamSkills} teamProjects={teamProjects}/></div>}
+      {/* Manager's own team community — scope to their OWN email so they see the
+          team they lead (their reports have manager_email == this manager's email). */}
+      {tab==="community"&&<Community profile={{...profile,manager_email:profile?.email||profile?.manager_email}}/>}
       {tab==="profile"&&<div style={{maxWidth:640,margin:"0 auto",padding:"28px 24px",display:"flex",flexDirection:"column",gap:16}}>
         <Card style={{padding:"22px 24px"}}>
           <div style={{display:"flex",alignItems:"center",gap:18,marginBottom:20}}>

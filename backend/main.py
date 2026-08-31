@@ -1336,6 +1336,22 @@ def _notify(cur, member_name, ntype, title, message, actor=None, thread_id=None,
                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                 (member_name, manager, ntype, title, message, actor, thread_id))
 
+
+def _session_identity(request: Request):
+    """Return {name, email} from a valid session, or None. Used to stop an
+    AUTHENTICATED user from posting/reacting as someone else — the client-sent
+    author is overridden by the real session identity when one exists. Demo
+    profiles (no session) keep their supplied name, so demo mode still works."""
+    try:
+        payload = get_current_user(request)
+    except HTTPException:
+        return None
+    except Exception:
+        return None
+    prof = (payload or {}).get("profile") or {}
+    nm = prof.get("name") or prof.get("displayName")
+    return {"name": nm, "email": prof.get("email")} if nm else None
+
 def _community_streak(cur, space: str, author_name: str) -> int:
     """Consecutive days (ending today or the most recent activity day) the
     author posted a thread or reply in this space. Real, computed from
@@ -1422,10 +1438,13 @@ def list_community_threads(space: str = None, tag: str = None, product: str = No
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/community/threads")
-def create_community_thread(body: CommunityThreadCreate):
+def create_community_thread(body: CommunityThreadCreate, request: Request):
     if not body.title.strip():
         raise HTTPException(status_code=422, detail="title is required.")
     vis = body.visibility if body.visibility in ("private", "team", "public") else "team"
+    ident = _session_identity(request)
+    author_name = (ident and ident["name"]) or body.author_name
+    author_email = (ident and ident["email"]) or body.author_email
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1433,7 +1452,7 @@ def create_community_thread(body: CommunityThreadCreate):
                               (space, author_name, author_email, manager_email, title, body, tag, product, visibility, mentions)
                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                               RETURNING id, author_name, author_email, manager_email, title, body, tag, product, visibility, mentions, created_at""",
-                           (body.space, body.author_name, body.author_email, body.manager_email,
+                           (body.space, author_name, author_email, body.manager_email,
                             body.title.strip(), (body.body or "").strip() or None, body.tag, body.product,
                             vis, json.dumps(body.mentions or [])))
                 t = dict(cur.fetchone())
@@ -1444,25 +1463,92 @@ def create_community_thread(body: CommunityThreadCreate):
                 # 1) @mentions (any visibility) — notify each tagged person.
                 for m in (body.mentions or []):
                     nm = (m.get("name") if isinstance(m, dict) else None)
-                    if nm and nm != body.author_name:
-                        _notify(cur, nm, "mention", f"{body.author_name} mentioned you",
-                                body.title.strip()[:140], actor=body.author_name, thread_id=tid, manager=body.manager_email)
-                # 2) public post — light "new public post" notice to everyone else in the directory.
+                    if nm and nm != author_name:
+                        _notify(cur, nm, "mention", f"{author_name} mentioned you",
+                                body.title.strip()[:140], actor=author_name, thread_id=tid, manager=body.manager_email)
+                # 2) public post — light "new public post" notice to others. Capped
+                # so a huge directory can't create thousands of rows per post.
                 if vis == "public":
                     cur.execute("""SELECT DISTINCT TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS nm
-                                   FROM employee_directory WHERE is_active=TRUE""")
+                                   FROM employee_directory WHERE is_active=TRUE LIMIT %s""",
+                                (int(os.getenv("COMMUNITY_PUBLIC_NOTIFY_CAP", "150")),))
                     for (nm,) in cur.fetchall():
-                        if nm and nm != body.author_name:
-                            _notify(cur, nm, "public_post", f"{body.author_name} posted to all teams",
-                                    body.title.strip()[:140], actor=body.author_name, thread_id=tid)
+                        if nm and nm != author_name:
+                            _notify(cur, nm, "public_post", f"{author_name} posted to all teams",
+                                    body.title.strip()[:140], actor=author_name, thread_id=tid)
         return {"ok": True, "thread": t}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class CommunityThreadEdit(BaseModel):
+    editor_name: str
+    title: Optional[str] = None
+    body: Optional[str] = None
+    tag: Optional[str] = None
+    visibility: Optional[str] = None
+
+def _can_modify(thread, editor_name, ident):
+    """Only the post's author may edit/delete it. When a session exists, the
+    session identity is authoritative; otherwise fall back to the supplied name."""
+    who = (ident and ident["name"]) or editor_name
+    return who and thread.get("author_name") == who
+
+@app.put("/api/community/threads/{thread_id}")
+def edit_community_thread(thread_id: int, body: CommunityThreadEdit, request: Request):
+    ident = _session_identity(request)
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT author_name FROM community_threads WHERE id=%s", (thread_id,))
+                thread = cur.fetchone()
+                if not thread:
+                    raise HTTPException(status_code=404, detail="Thread not found.")
+                if not _can_modify(thread, body.editor_name, ident):
+                    raise HTTPException(status_code=403, detail="Only the author can edit this post.")
+                sets, params = [], []
+                if body.title is not None and body.title.strip():
+                    sets.append("title=%s"); params.append(body.title.strip())
+                if body.body is not None:
+                    sets.append("body=%s"); params.append(body.body.strip() or None)
+                if body.tag is not None:
+                    sets.append("tag=%s"); params.append(body.tag)
+                if body.visibility in ("private", "team", "public"):
+                    sets.append("visibility=%s"); params.append(body.visibility)
+                if not sets:
+                    return {"ok": True}
+                params.append(thread_id)
+                cur.execute(f"UPDATE community_threads SET {','.join(sets)} WHERE id=%s", tuple(params))
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/community/threads/{thread_id}")
+def delete_community_thread(thread_id: int, editor_name: str, request: Request):
+    ident = _session_identity(request)
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT author_name FROM community_threads WHERE id=%s", (thread_id,))
+                thread = cur.fetchone()
+                if not thread:
+                    raise HTTPException(status_code=404, detail="Thread not found.")
+                if not _can_modify(thread, editor_name, ident):
+                    raise HTTPException(status_code=403, detail="Only the author can delete this post.")
+                cur.execute("DELETE FROM community_threads WHERE id=%s", (thread_id,))  # replies/reactions cascade
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/community/threads/{thread_id}/replies")
-def create_community_reply(thread_id: int, body: CommunityReplyCreate):
+def create_community_reply(thread_id: int, body: CommunityReplyCreate, request: Request):
     if not body.text.strip():
         raise HTTPException(status_code=422, detail="text is required.")
+    ident = _session_identity(request)
+    author_name = (ident and ident["name"]) or body.author_name
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1472,20 +1558,20 @@ def create_community_reply(thread_id: int, body: CommunityReplyCreate):
                     raise HTTPException(status_code=404, detail="Thread not found.")
                 cur.execute("""INSERT INTO community_replies (thread_id, author_name, text)
                               VALUES (%s,%s,%s) RETURNING author_name, text, created_at""",
-                           (thread_id, body.author_name, body.text.strip()))
+                           (thread_id, author_name, body.text.strip()))
                 r = dict(cur.fetchone())
                 r["created_at"] = str(r["created_at"])
                 # Notify the post's author that someone replied (not on self-reply).
-                if thread["author_name"] and thread["author_name"] != body.author_name:
-                    _notify(cur, thread["author_name"], "reply", f"{body.author_name} replied to your post",
-                            (thread["title"] or "")[:140], actor=body.author_name, thread_id=thread_id,
+                if thread["author_name"] and thread["author_name"] != author_name:
+                    _notify(cur, thread["author_name"], "reply", f"{author_name} replied to your post",
+                            (thread["title"] or "")[:140], actor=author_name, thread_id=thread_id,
                             manager=thread["manager_email"])
                 # Notify anyone @mentioned in the reply.
                 for m in (body.mentions or []):
                     nm = (m.get("name") if isinstance(m, dict) else None)
-                    if nm and nm != body.author_name:
-                        _notify(cur, nm, "mention", f"{body.author_name} mentioned you in a reply",
-                                (thread["title"] or "")[:140], actor=body.author_name, thread_id=thread_id)
+                    if nm and nm != author_name:
+                        _notify(cur, nm, "mention", f"{author_name} mentioned you in a reply",
+                                (thread["title"] or "")[:140], actor=author_name, thread_id=thread_id)
         return {"ok": True, "reply": r}
     except HTTPException:
         raise
@@ -1529,11 +1615,14 @@ class CommunityReact(BaseModel):
     member_name: str
 
 @app.post("/api/community/threads/{thread_id}/react")
-def toggle_community_reaction(thread_id: int, body: CommunityReact):
+def toggle_community_reaction(thread_id: int, body: CommunityReact, request: Request):
     """Toggle a 👍 kudos on a post. Returns the new count + whether the caller
     now has one active. Notifies the post author on a fresh kudos."""
-    if not body.member_name:
+    ident = _session_identity(request)
+    member = (ident and ident["name"]) or body.member_name
+    if not member:
         raise HTTPException(status_code=422, detail="member_name required.")
+    body_member_name = member
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1542,16 +1631,16 @@ def toggle_community_reaction(thread_id: int, body: CommunityReact):
                 if not thread:
                     raise HTTPException(status_code=404, detail="Thread not found.")
                 cur.execute("DELETE FROM community_reactions WHERE thread_id=%s AND member_name=%s RETURNING id",
-                            (thread_id, body.member_name))
+                            (thread_id, body_member_name))
                 removed = cur.fetchone()
                 reacted = False
                 if not removed:
                     cur.execute("INSERT INTO community_reactions (thread_id, member_name) VALUES (%s,%s) ON CONFLICT DO NOTHING",
-                                (thread_id, body.member_name))
+                                (thread_id, body_member_name))
                     reacted = True
-                    if thread["author_name"] and thread["author_name"] != body.member_name:
-                        _notify(cur, thread["author_name"], "kudos", f"{body.member_name} gave your post kudos 👍",
-                                (thread["title"] or "")[:140], actor=body.member_name, thread_id=thread_id,
+                    if thread["author_name"] and thread["author_name"] != body_member_name:
+                        _notify(cur, thread["author_name"], "kudos", f"{body_member_name} gave your post kudos 👍",
+                                (thread["title"] or "")[:140], actor=body_member_name, thread_id=thread_id,
                                 manager=thread["manager_email"])
                 cur.execute("SELECT COUNT(*) AS c FROM community_reactions WHERE thread_id=%s", (thread_id,))
                 count = cur.fetchone()["c"]

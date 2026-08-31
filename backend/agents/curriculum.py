@@ -39,6 +39,7 @@ from .config import (
 from . import curriculum_rag
 from . import rag as shared_rag
 from evaluation import evaluate_and_log, extract_tool_contexts
+from guardrails import check_output
 
 import json
 import time
@@ -1062,7 +1063,14 @@ def node_guardrail(state: dict) -> dict:
         except Exception:
             pass
 
-    return {**state, "guardrail_result": {"kind": "answer", "label": "meta", "answer": resp["content"]}}
+    # Output guardrail on the prose guidance answer (empty/too-short/vague check),
+    # same net every text-answering agent now runs. Annotate-only; never blocks.
+    answer = resp["content"]
+    try:
+        answer = check_output(answer, agent="curriculum", expect_citations=False, min_words=4)["answer"]
+    except Exception:
+        pass
+    return {**state, "guardrail_result": {"kind": "answer", "label": "meta", "answer": answer}}
 
 
 # ── Quality check ─────────────────────────────────────────────────────────────
