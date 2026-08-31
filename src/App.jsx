@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useReducer, useMemo, useCallback } from "react";
+import { useState, useRef, useEffect, useReducer, useMemo, useCallback, Fragment } from "react";
 import { hierarchy as d3Hierarchy, tree as d3Tree } from "d3-hierarchy";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import { P, getThemeMode, setThemeMode } from "./theme/tokens.js";
@@ -95,7 +95,7 @@ const SKILLS=["AEP Segments","Analytics/CJA","Data Ingestion","AJO","RT-CDP","Ma
 // forward, and matches /api/tracks' labels for the default track set.
 const TRACK_LABELS={"rtcdp":"Real-Time CDP","analytics":"Adobe Analytics","ajo":"Adobe Journey Optimizer","cja":"Customer Journey Analytics",
   "aa-sdk":"Adobe Analytics / Web SDK","target":"Adobe Target","campaign":"Adobe Campaign","marketo":"Marketo Engage",
-  "da":"Data Analytics","de":"Data Engineering","es":"Engineering Services"};
+  "da":"Data Architect","de":"Data Engineer","es":"Engineering Services"};
 
 // The confidence threshold to unlock the Capstone gate. Was previously a
 // magic 0.75 literal duplicated in Capstone() and EXPDash's cross-track
@@ -1183,6 +1183,55 @@ function ManagerAgent({profile,groqKey,onLog,dbMembers,liveSummary,teamSkills,te
 
 
 // ── Nav + Tabs ────────────────────────────────────────────────────────────────
+// ── Global notification bell (Nav) — unread count + dropdown, polls the same
+// /api/notifications endpoints the community feature writes to via _notify().
+function NavBell({memberName}){
+  const [items,setItems]=useState([]);
+  const [unread,setUnread]=useState(0);
+  const [open,setOpen]=useState(false);
+  const load=()=>{ if(!memberName)return;
+    fetch(`${BACKEND}/api/notifications?member_name=${encodeURIComponent(memberName)}`).then(r=>r.json())
+      .then(d=>{setItems(d?.notifications||[]);setUnread(d?.unread||0);}).catch(()=>{}); };
+  useEffect(()=>{load();const iv=setInterval(load,45000);return()=>clearInterval(iv);},[memberName]);
+  const markRead=async(id)=>{ setItems(p=>p.map(n=>n.id===id?{...n,is_read:true}:n)); setUnread(u=>Math.max(0,u-1));
+    try{await fetch(`${BACKEND}/api/notifications/${id}/read`,{method:"PUT"});}catch(e){} };
+  const markAll=async()=>{ setItems(p=>p.map(n=>({...n,is_read:true}))); setUnread(0);
+    try{await fetch(`${BACKEND}/api/notifications/read-all?member_name=${encodeURIComponent(memberName)}`,{method:"PUT"});}catch(e){} };
+  const emoji={mention:"💬",reply:"↩️",public_post:"🌐",approval:"✅",decline:"⚠️",weekly_reminder:"🗓️",capstone_complete:"🏆"};
+  if(!memberName)return null;
+  return(
+    <div style={{position:"relative",flexShrink:0}}>
+      <button onClick={()=>setOpen(o=>!o)} aria-label="Notifications" title="Notifications"
+        style={{position:"relative",background:open?P.hovGrey:"transparent",border:"none",borderRadius:9,padding:"7px",cursor:"pointer",display:"flex",alignItems:"center"}}>
+        <Ic as={Bell} size={18} color={unread>0?P.txt:P.muted}/>
+        {unread>0&&<span style={{position:"absolute",top:2,right:2,minWidth:16,height:16,padding:"0 4px",boxSizing:"border-box",background:P.red,color:"#fff",borderRadius:99,fontSize:9.5,fontWeight:600,display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1}}>{unread>9?"9+":unread}</span>}
+      </button>
+      {open&&<>
+        <div onClick={()=>setOpen(false)} style={{position:"fixed",inset:0,zIndex:40}}/>
+        <div style={{position:"absolute",top:"calc(100% + 6px)",right:0,width:320,maxHeight:420,overflowY:"auto",background:P.panel,border:`1px solid ${P.border}`,borderRadius:12,boxShadow:P.shadow,zIndex:41}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"11px 14px",borderBottom:`1px solid ${P.border}`,position:"sticky",top:0,background:P.panel}}>
+            <span style={{fontSize:13,fontWeight:600,color:P.txt}}>Notifications{unread>0?` · ${unread}`:""}</span>
+            {unread>0&&<button onClick={markAll} style={{fontSize:11,color:P.blue,background:"transparent",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>Mark all read</button>}
+          </div>
+          {items.length===0&&<div style={{padding:"24px 14px",textAlign:"center",fontSize:12.5,color:P.muted}}>You're all caught up.</div>}
+          {items.map(n=>(
+            <div key={n.id} onClick={()=>!n.is_read&&markRead(n.id)}
+              style={{display:"flex",gap:10,padding:"10px 14px",borderBottom:`1px solid ${P.bfaint}`,cursor:n.is_read?"default":"pointer",background:n.is_read?"transparent":P.blueGh}}>
+              <span style={{fontSize:16,flexShrink:0,lineHeight:1.3}}>{emoji[n.type]||"🔔"}</span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:12.5,fontWeight:n.is_read?400:600,color:P.txt,marginBottom:1}}>{n.title}</div>
+                {n.message&&<div style={{fontSize:11.5,color:P.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.message}</div>}
+                <div style={{fontSize:10.5,color:P.dim,marginTop:2}}>{timeAgo(n.created_at)}</div>
+              </div>
+              {!n.is_read&&<span style={{width:8,height:8,borderRadius:99,background:P.blue,flexShrink:0,marginTop:4}}/>}
+            </div>
+          ))}
+        </div>
+      </>}
+    </div>
+  );
+}
+
 function Nav({initial,name,sub,color,badge,onLogout,progress,onToggleTheme,avatarEmoji,persona,onGoToProfile}){
   const isDark=getThemeMode()==="dark";
   const [menuOpen,setMenuOpen]=useState(false);
@@ -1201,6 +1250,7 @@ function Nav({initial,name,sub,color,badge,onLogout,progress,onToggleTheme,avata
     </div>
     {badge&&<span style={{background:P.amberBg,color:P.amber,border:`1px solid ${P.amber}30`,borderRadius:6,fontSize:10,padding:"2px 9px",fontWeight:500,letterSpacing:.5,textTransform:"uppercase",flexShrink:0}}>{badge}</span>}
     <div style={{flex:1}}/>
+    <NavBell memberName={name}/>
     {/* User — avatar opens an account menu (theme switch + sign out) */}
     <div style={{position:"relative",flexShrink:0}}>
       <button onClick={()=>setMenuOpen(o=>!o)} aria-label="Account menu" aria-expanded={menuOpen}
@@ -1909,7 +1959,10 @@ function NJCommunity({profile:p}){
 // handleReply didn't even touch THREADS at all — they just incremented a fake
 // points counter with no thread/reply ever created, so posts silently vanished
 // on refresh; now every post/reply is a real row.
-function Community({userName}){
+function Community({profile,userName:userNameProp}){
+  const userName=profile?.name||userNameProp||"You";
+  const email=profile?.email||"";
+  const mgr=profile?.manager_email||profile?.managerEmail||profile?.manager||"";
   const [filter,setFilter]=useState("All");
   const [open,setOpen]=useState(null);
   const [showLeaderboard,setShowLeaderboard]=useState(false);
@@ -1918,33 +1971,49 @@ function Community({userName}){
   const [threads,setThreads]=useState([]);
   const [leaderboard,setLeaderboard]=useState([]);
   const [newTitle,setNewTitle]=useState("");
+  const [newBody,setNewBody]=useState("");
   const [newTag,setNewTag]=useState("Projects");
+  const [newVis,setNewVis]=useState("team");        // private | team | public
+  const [mentions,setMentions]=useState([]);         // [{name,email}]
+  const [mentionQ,setMentionQ]=useState("");
+  const [memberOptions,setMemberOptions]=useState([]);
   const [showNew,setShowNew]=useState(false);
   const [replyText,setReplyText]=useState({});
   const PROD_COLORS={"AJO":P.red,"CJA":P.purple,"Analytics":P.grn,"RTCDP":P.blue};
+  const VIS={private:{l:"Private",c:P.dim,i:"🔒",d:"Only you"},team:{l:"Team",c:P.blue,i:"👥",d:"Everyone under your manager"},public:{l:"Public",c:P.grn,i:"🌐",d:"Shared across all teams"}};
 
-  const loadThreads=()=>fetch(`${BACKEND}/api/community/threads?space=exp`).then(r=>r.json())
-    .then(d=>setThreads((d.threads||[]).map(t=>({...t,author:t.author_name,time:timeAgo(t.created_at),
-      replies:(t.replies||[]).map(r=>({...r,author:r.author_name}))}))))
-    .catch(()=>{});
+  const loadThreads=()=>{
+    const q=`as_name=${encodeURIComponent(userName)}${email?`&as_email=${encodeURIComponent(email)}`:""}${mgr?`&my_manager=${encodeURIComponent(mgr)}`:""}`;
+    fetch(`${BACKEND}/api/community/threads?${q}`).then(r=>r.json())
+      .then(d=>setThreads((d.threads||[]).map(t=>({...t,author:t.author_name,time:timeAgo(t.created_at),
+        replies:(t.replies||[]).map(r=>({...r,author:r.author_name}))}))))
+      .catch(()=>{});
+  };
   const loadStats=()=>fetch(`${BACKEND}/api/community/stats?space=exp&author_name=${encodeURIComponent(userName)}`)
     .then(r=>r.json()).then(d=>setPostPoints(d)).catch(()=>{});
   const loadLeaderboard=()=>fetch(`${BACKEND}/api/community/leaderboard?space=exp`).then(r=>r.json())
     .then(d=>setLeaderboard(d.leaderboard||[])).catch(()=>{});
-  useEffect(()=>{loadThreads();loadStats();loadLeaderboard();},[]);
+  const loadMembers=()=>{ if(!mgr){setMemberOptions([]);return;}
+    fetch(`${BACKEND}/api/community/members?manager_email=${encodeURIComponent(mgr)}`).then(r=>r.json())
+      .then(d=>setMemberOptions((d.members||[]).filter(m=>m.name!==userName))).catch(()=>{}); };
+  useEffect(()=>{loadThreads();loadStats();loadLeaderboard();loadMembers();},[userName,email,mgr]);
 
   const visible=threads
     .filter(t=>filter==="All"||t.tag===filter)
     .filter(t=>product==="All"||(t.product||"General")===product);
   const lb=leaderboard;
+  const mentionMatches=mentionQ.trim()?memberOptions.filter(m=>m.name.toLowerCase().includes(mentionQ.toLowerCase())&&!mentions.some(x=>x.email===m.email)).slice(0,6):[];
+  const addMention=m=>{setMentions(prev=>[...prev,m]);setMentionQ("");};
+  const removeMention=em=>setMentions(prev=>prev.filter(x=>x.email!==em));
 
   const handlePost=async()=>{
     if(!newTitle.trim())return;
     try{
       await fetch(`${BACKEND}/api/community/threads`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({space:"exp",author_name:userName,title:newTitle.trim(),tag:newTag,
-          product:product!=="All"?product:null})});
-      setNewTitle("");setShowNew(false);
+        body:JSON.stringify({space:"exp",author_name:userName,author_email:email,manager_email:mgr,
+          title:newTitle.trim(),body:newBody.trim()||null,tag:newTag,visibility:newVis,
+          product:product!=="All"?product:null,mentions})});
+      setNewTitle("");setNewBody("");setMentions([]);setMentionQ("");setShowNew(false);
       loadThreads();loadStats();loadLeaderboard();
     }catch{}
   };
@@ -1952,23 +2021,33 @@ function Community({userName}){
     if(!text?.trim())return;
     try{
       await fetch(`${BACKEND}/api/community/threads/${threadId}/replies`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({author_name:userName,text:text.trim()})});
+        body:JSON.stringify({author_name:userName,author_email:email,text:text.trim()})});
       setReplyText(prev=>({...prev,[threadId]:""}));
       loadThreads();loadStats();loadLeaderboard();
     }catch{}
+  };
+  const toggleKudos=async(t)=>{
+    // optimistic
+    setThreads(prev=>prev.map(x=>x.id===t.id?{...x,reacted:!x.reacted,reactions:(x.reactions||0)+(x.reacted?-1:1)}:x));
+    try{
+      await fetch(`${BACKEND}/api/community/threads/${t.id}/react`,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({member_name:userName})});
+      loadStats();loadLeaderboard();
+    }catch{ loadThreads(); }
   };
 
   return(<div style={{padding:"20px 24px",maxWidth:760,margin:"0 auto"}}>
     {/* Points strip */}
     <div style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:12,padding:"12px 18px",marginBottom:16,display:"flex",alignItems:"center",gap:20,flexWrap:"wrap"}}>
       <div style={{display:"flex",gap:16}}>
-        {[{l:"Points",v:postPoints.points,c:P.blue},{l:"Posts",v:postPoints.posts,c:P.purple},{l:"Replies",v:postPoints.replies,c:P.grn},{l:"Streak",v:`${postPoints.streak}d`,c:P.amber}].map(s=>(
+        {[{l:"Points",v:postPoints.points,c:P.blue},{l:"Kudos",v:postPoints.kudos??0,c:P.grn},{l:"Posts",v:postPoints.posts,c:P.purple},{l:"Replies",v:postPoints.replies,c:P.muted},{l:"Streak",v:`${postPoints.streak}d`,c:P.amber}].map(s=>(
           <div key={s.l} style={{textAlign:"center"}}>
             <div style={{fontSize:16,fontWeight:500,color:s.c}}>{s.v}</div>
             <div style={{fontSize:10.5,color:P.muted}}>{s.l}</div>
           </div>
         ))}
       </div>
+      <span title="Posts +2 · replies +3 · each 👍 kudos your posts receive +5. Kudos are the real driver — helpfulness beats volume." style={{fontSize:10.5,color:P.dim,cursor:"help",borderBottom:`1px dotted ${P.dim}`}}>How points work</span>
       <div style={{flex:1}}/>
       <button onClick={()=>setShowLeaderboard(!showLeaderboard)}
         style={{background:showLeaderboard?P.blueGh:"transparent",border:`1px solid ${showLeaderboard?P.blue:P.border}`,borderRadius:7,padding:"5px 12px",fontSize:12,cursor:"pointer",color:showLeaderboard?P.blue:P.muted,fontFamily:"inherit",display:"inline-flex",alignItems:"center",gap:5}}>
@@ -1986,7 +2065,7 @@ function Community({userName}){
           <div style={{width:28,height:28,borderRadius:"50%",background:P.purple,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:500,fontSize:11,flexShrink:0}}>{(row.name[0]||"?").toUpperCase()}</div>
           <div style={{flex:1}}>
             <div style={{fontSize:13,fontWeight:600,color:row.name===userName?P.blue:P.txt}}>{row.name}{row.name===userName?" (You)":""}</div>
-            <div style={{fontSize:11,color:P.muted}}>{row.posts} posts · {row.replies} replies · {row.streak}d streak</div>
+            <div style={{fontSize:11,color:P.muted}}>👍 {row.kudos??0} kudos · {row.posts} posts · {row.replies} replies · {row.streak}d streak</div>
           </div>
           <span style={{fontSize:14,fontWeight:500,color:P.blue}}>{row.points} pts</span>
         </div>
@@ -1999,17 +2078,57 @@ function Community({userName}){
         <button key={f} onClick={()=>setFilter(f)} style={{background:filter===f?P.blue:"transparent",color:filter===f?"#fff":P.muted,border:`1px solid ${filter===f?P.blue:P.border}`,borderRadius:6,padding:"5px 12px",fontSize:12,fontWeight:filter===f?600:400,cursor:"pointer",fontFamily:"inherit"}}>{f}</button>
       ))}
       <div style={{flex:1}}/>
-      <button onClick={()=>setShowNew(s=>!s)} style={{background:`linear-gradient(135deg,${P.blue},${P.blueDk})`,color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>+ New Post · +15 pts</button>
+      <button onClick={()=>setShowNew(s=>!s)} style={{background:`linear-gradient(135deg,${P.blue},${P.blueDk})`,color:"#fff",border:"none",borderRadius:6,padding:"5px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>+ New Post</button>
     </div>
     {showNew&&<Card style={{padding:"16px 18px",marginBottom:14}}>
       <div style={{fontSize:13,fontWeight:600,color:P.txt,marginBottom:10}}>New post</div>
       <input value={newTitle} onChange={e=>setNewTitle(e.target.value)}
         placeholder="What's your question or topic?"
-        style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"9px 12px",fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:10}}/>
+        style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"9px 12px",fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:8}}/>
+      <textarea value={newBody} onChange={e=>setNewBody(e.target.value)} rows={3}
+        placeholder="Add details (optional)…"
+        style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"9px 12px",fontSize:13,color:P.txt,background:P.bg,outline:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:10,resize:"vertical"}}/>
+
+      {/* Visibility */}
+      <div style={{fontSize:11,fontWeight:600,color:P.dim,textTransform:"uppercase",letterSpacing:.5,marginBottom:6}}>Who can see this?</div>
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+        {Object.entries(VIS).map(([k,v])=>(
+          <button key={k} onClick={()=>setNewVis(k)} title={v.d}
+            style={{display:"flex",flexDirection:"column",alignItems:"flex-start",gap:1,padding:"7px 12px",borderRadius:9,cursor:"pointer",fontFamily:"inherit",textAlign:"left",
+              background:newVis===k?v.c+"18":"transparent",border:`1.5px solid ${newVis===k?v.c:P.border}`}}>
+            <span style={{fontSize:12.5,fontWeight:600,color:newVis===k?v.c:P.txt}}>{v.i} {v.l}</span>
+            <span style={{fontSize:10.5,color:P.muted}}>{v.d}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Mentions */}
+      <div style={{fontSize:11,fontWeight:600,color:P.dim,textTransform:"uppercase",letterSpacing:.5,marginBottom:6}}>Tag people {mgr?"":"(sign in with your team to tag)"}</div>
+      <div style={{position:"relative",marginBottom:12}}>
+        {mentions.length>0&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:6}}>
+          {mentions.map(m=>(
+            <span key={m.email} style={{display:"inline-flex",alignItems:"center",gap:5,background:P.blueGh,color:P.blue,borderRadius:99,padding:"2px 6px 2px 10px",fontSize:11.5,fontWeight:600}}>
+              @{m.name}<button onClick={()=>removeMention(m.email)} style={{background:"transparent",border:"none",color:P.blue,cursor:"pointer",fontSize:13,lineHeight:1,padding:0}}>×</button>
+            </span>
+          ))}
+        </div>}
+        <input value={mentionQ} onChange={e=>setMentionQ(e.target.value)} disabled={!mgr}
+          placeholder={mgr?"Type a teammate's name…":"No team to tag"}
+          style={{width:"100%",border:`1px solid ${P.border}`,borderRadius:8,padding:"8px 12px",fontSize:12.5,color:P.txt,background:mgr?P.bg:P.surface,outline:"none",boxSizing:"border-box",fontFamily:"inherit"}}/>
+        {mentionMatches.length>0&&<div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:20,background:P.panel,border:`1px solid ${P.border}`,borderRadius:8,marginTop:4,boxShadow:P.shadow,overflow:"hidden"}}>
+          {mentionMatches.map(m=>(
+            <button key={m.email} onClick={()=>addMention(m)} style={{display:"flex",flexDirection:"column",alignItems:"flex-start",width:"100%",background:"transparent",border:"none",borderBottom:`1px solid ${P.bfaint}`,padding:"7px 12px",cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+              <span style={{fontSize:12.5,fontWeight:600,color:P.txt}}>{m.name}</span>
+              <span style={{fontSize:10.5,color:P.muted}}>{m.email}</span>
+            </button>
+          ))}
+        </div>}
+      </div>
+
       <div style={{display:"flex",gap:8,alignItems:"center"}}>
         <select value={newTag} onChange={e=>setNewTag(e.target.value)}
           style={{border:`1px solid ${P.border}`,borderRadius:7,padding:"7px 10px",fontSize:12.5,color:P.txt,background:P.bg,outline:"none",flex:1}}>
-          {["Projects","Platform Q&A","Cross-skilling"].map(t=><option key={t}>{t}</option>)}
+          {["Projects","Platform Q&A","Cross-skilling","Announcement","Kudos"].map(t=><option key={t}>{t}</option>)}
         </select>
         <button onClick={handlePost} disabled={!newTitle.trim()}
           style={{background:newTitle.trim()?P.blue:"#aaa",color:"#fff",border:"none",borderRadius:8,padding:"8px 18px",fontSize:13,fontWeight:600,cursor:newTitle.trim()?"pointer":"not-allowed",fontFamily:"inherit"}}>
@@ -2039,15 +2158,24 @@ function Community({userName}){
       <Card key={t.id} style={{marginBottom:10}}>
         <div onClick={()=>setOpen(open===t.id?null:t.id)} style={{padding:"13px 16px",cursor:"pointer",display:"flex",alignItems:"flex-start",gap:12}}>
           <Avatar src={`https://i.pravatar.cc/96?u=${encodeURIComponent(t.author||String(t.id))}`} alt={t.author} size={32}/>
-          <div style={{flex:1}}>
-            <div style={{fontSize:13.5,fontWeight:600,color:P.txt,marginBottom:5}}>{t.title}</div>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:13.5,fontWeight:600,color:P.txt,marginBottom:t.body?3:5}}>{t.title}</div>
+            {t.body&&<div style={{fontSize:12.5,color:P.muted,marginBottom:6,lineHeight:1.5,whiteSpace:"pre-line"}}>{t.body}</div>}
+            {Array.isArray(t.mentions)&&t.mentions.length>0&&<div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:6}}>
+              {t.mentions.map((m,mi)=>(<span key={mi} style={{fontSize:11,fontWeight:600,color:P.blue,background:P.blueGh,borderRadius:99,padding:"1px 8px"}}>@{m.name||m}</span>))}
+            </div>}
             <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              {VIS[t.visibility]&&<span title={VIS[t.visibility].d} style={{fontSize:10.5,fontWeight:600,color:VIS[t.visibility].c,background:VIS[t.visibility].c+"15",borderRadius:99,padding:"1px 8px"}}>{VIS[t.visibility].i} {VIS[t.visibility].l}</span>}
               <TagPill tag={t.tag}/>
               <span style={{fontSize:11,color:P.dim}}>{t.author}</span>
               <span style={{fontSize:11,color:P.dim}}>· {t.replies.length} replies</span>
               <span style={{fontSize:11,color:P.dim}}>· {t.time}</span>
             </div>
           </div>
+          <button onClick={e=>{e.stopPropagation();toggleKudos(t);}} title={t.reacted?"Remove kudos":"Give kudos"}
+            style={{flexShrink:0,display:"inline-flex",alignItems:"center",gap:5,background:t.reacted?P.grnBg:"transparent",border:`1px solid ${t.reacted?P.grn:P.border}`,borderRadius:99,padding:"4px 11px",cursor:"pointer",fontFamily:"inherit",color:t.reacted?P.grn:P.muted,fontSize:12.5,fontWeight:600,transition:"all .15s",marginRight:8}}>
+            👍 {t.reactions||0}
+          </button>
           <span style={{flexShrink:0}}><Ic as={open===t.id?ChevronUp:ChevronDown} size={14} color={P.dim}/></span>
         </div>
         {open===t.id&&<div style={{borderTop:`1px solid ${P.bfaint}`,padding:"12px 16px 14px"}}>
@@ -2063,7 +2191,7 @@ function Community({userName}){
           ))}
           <div style={{display:"flex",gap:8,marginTop:4}}>
             <input value={replyText[t.id]||""} onChange={e=>setReplyText(prev=>({...prev,[t.id]:e.target.value}))}
-              placeholder="Add a reply… (+5 pts)" onKeyDown={e=>e.key==="Enter"&&handleReply(t.id,replyText[t.id])}
+              placeholder="Add a reply…" onKeyDown={e=>e.key==="Enter"&&handleReply(t.id,replyText[t.id])}
               style={{flex:1,border:`1px solid ${P.border}`,borderRadius:7,padding:"7px 12px",fontSize:12.5,outline:"none",background:P.bg,color:P.txt}}/>
             <button onClick={()=>handleReply(t.id,replyText[t.id])} style={{background:`linear-gradient(135deg,${P.blue},${P.blueDk})`,color:"#fff",border:"none",borderRadius:7,padding:"7px 16px",fontSize:12.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Reply</button>
           </div>
@@ -2171,13 +2299,16 @@ const renderLiteMarkdown=(text)=>{
 };
 
 function LearningAssistant({groqKey,onLog,onJudge,profile,githubToken,onConfUpdate,dashboard="new_joiner"}){
-  const [mode,setMode]=useState("socratic");
+  // Default to "Explain fully" (Reasoning) for signed-in learners — most people
+  // want the answer. Demo profiles (no real session) can't use Reasoning, so they
+  // start in "Guide me" (Socratic), which works without a login.
+  const [mode,setMode]=useState(profile?.id?"reasoning":"socratic");
   const firstName=profile?.name?.split(" ")[0]||"there";
   const module=profile?.module||"Segment Evaluation Logic";
 
   const initMsgs={
-    socratic:[{role:"assistant",content:`Hi ${firstName}. I'm here to help you work through ${module}. What aspect would you like to explore?`}],
-    reasoning:[{role:"assistant",content:`Hi ${profile?.displayName||firstName}. Tell me what you want to understand about ${module} and I'll walk through the logic with you step by step.`}],
+    socratic:[{role:"assistant",content:`Hi ${firstName}. In Guide me mode I won't hand you the answer — I'll ask questions to help you reason through ${module} yourself. Switch to Explain fully anytime if you'd rather I just explain it. What would you like to explore?`}],
+    reasoning:[{role:"assistant",content:`Hi ${profile?.displayName||firstName}. Ask me anything about ${module} and I'll explain it fully, step by step. Prefer to work it out yourself? Switch to Guide me for hints instead of answers.`}],
   };
   const [msgs,setMsgs]=useState({socratic:initMsgs.socratic,reasoning:initMsgs.reasoning});
   const [judges,setJudges]=useState({});
@@ -2738,8 +2869,8 @@ function LearningAssistant({groqKey,onLog,onJudge,profile,githubToken,onConfUpda
         style={{background:"transparent",border:`1px solid ${P.border}`,borderRadius:7,padding:"5px 9px",cursor:"pointer",color:P.muted,flexShrink:0,fontSize:14,lineHeight:1}}>☰</button>}
       {/* Mode toggle */}
       <div style={{display:"flex",background:P.surface,borderRadius:9,border:`1px solid ${P.border}`,padding:2,gap:2,flexShrink:0}}>
-        {[{id:"socratic",label:"Socratic"},{id:"reasoning",label:"Reasoning"}].map(m=>(
-          <button key={m.id} onClick={()=>switchMode(m.id)} style={{padding:"5px 14px",background:mode===m.id?P.panel:"transparent",color:mode===m.id?P.txt:P.muted,border:mode===m.id?`1px solid ${P.border}`:"1px solid transparent",borderRadius:7,fontSize:12.5,fontWeight:mode===m.id?600:400,cursor:"pointer",transition:"all .15s",boxShadow:mode===m.id?P.shadow:"none"}}>{m.label}</button>
+        {[{id:"socratic",label:"💡 Guide me",tip:"Hints and guiding questions — you reason it out yourself"},{id:"reasoning",label:"🧠 Explain fully",tip:"A full, step-by-step answer from the Reasoning agent"}].map(m=>(
+          <button key={m.id} onClick={()=>switchMode(m.id)} title={m.tip} style={{padding:"5px 14px",background:mode===m.id?P.panel:"transparent",color:mode===m.id?P.txt:P.muted,border:mode===m.id?`1px solid ${P.border}`:"1px solid transparent",borderRadius:7,fontSize:12.5,fontWeight:mode===m.id?600:400,cursor:"pointer",transition:"all .15s",boxShadow:mode===m.id?P.shadow:"none"}}>{m.label}</button>
         ))}
       </div>
       <div style={{flex:1}}/>
@@ -2861,7 +2992,7 @@ function LearningAssistant({groqKey,onLog,onJudge,profile,githubToken,onConfUpda
     {/* Sign-in required banner — Reasoning mode needs a real Adobe session for
         identity, rate limiting, and persistence; the demo persona picker has none. */}
     {needsRealLogin&&<div style={{padding:"10px 20px",background:P.grnBg||P.surface,borderTop:`1px solid ${P.border}`,flexShrink:0,display:"flex",alignItems:"center",gap:8,fontSize:12.5,color:P.muted}}>
-      <Ic as={Lock} size={13} color={P.muted}/> Sign in with your Adobe account to use the Reasoning agent. Demo profiles can still use Socratic mode.
+      <Ic as={Lock} size={13} color={P.muted}/> Sign in with your Adobe account for <strong style={{fontWeight:600,margin:"0 3px"}}>Explain fully</strong> mode. Demo profiles can still use <strong style={{fontWeight:600,margin:"0 3px"}}>Guide me</strong>.
     </div>}
 
     {/* Input bar */}
@@ -2872,7 +3003,7 @@ function LearningAssistant({groqKey,onLog,onJudge,profile,githubToken,onConfUpda
         onMouseLeave={e=>e.currentTarget.style.borderColor=P.border}>↑</button>
       <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&send()}
         disabled={needsRealLogin}
-        placeholder={needsRealLogin?"Sign in with Adobe to chat in Reasoning mode…":mode==="socratic"?"Ask anything — I'll guide you with questions…":"What do you want to understand?"}
+        placeholder={needsRealLogin?"Sign in with Adobe for Explain fully mode…":mode==="socratic"?"Ask anything — I'll guide you with questions…":"Ask anything — I'll explain it fully…"}
         style={{flex:1,border:`1px solid ${P.border}`,borderRadius:10,padding:"10px 16px",fontSize:14,outline:"none",background:needsRealLogin?P.panel:P.surface,color:P.txt,transition:"border-color .15s"}}/>
       {curMsgs.length>=5&&<button onClick={generateSummary} disabled={summaryLoading} title="Summarise session" style={{background:"transparent",border:`1px solid ${P.border}`,borderRadius:9,padding:"9px 11px",fontSize:13,cursor:"pointer",color:summaryLoading?P.dim:P.grn,flexShrink:0}}>
         {summaryLoading?"…":"◈"}
@@ -4495,6 +4626,124 @@ function computeEffectiveModules(modules,completedIds){
   });
 }
 
+// ── Game-style learning path — a winding vertical trail of level stepping-stones ──
+// Inspired by Duolingo / BYJU's: big round level nodes snaking down a curved road,
+// completed = green with a check, current = pulsing "you are here", locked = grey.
+// Click a node to open its topics. HTML nodes over one SVG road (no innerHTML).
+function LearningFlowMap({modules=[],profile=null,onOpenLesson=null}){
+  const [sel,setSel]=useState(null);
+  const dark=getThemeMode()==="dark";
+  const firstName=profile?.name?.split(" ")[0]||"You";
+  const n=modules.length;
+  const CW=470,cx=CW/2,AMP=118,STEP=162,TOP=58,D=70;
+  const HEIGHT=TOP+(Math.max(1,n)-1)*STEP+D/2+72;
+  const DONE="#5aa02a",DONE_D="#437a1e",CUR="#2f7fd6",CUR_D="#215d9e",TODO=dark?"#4a515c":"#c4cad2",TODO_D=dark?"#3a404a":"#aab1ba";
+  const pt=i=>({x:cx+AMP*Math.sin(i*0.9),y:TOP+i*STEP});
+  const icon=m=>{const s=((m.tag||"")+" "+(m.title||"")+" "+(m.theme||"")).toLowerCase();
+    if(/capstone|certif/.test(s))return"🏆"; if(/foundation|architect|overview|intro/.test(s))return"🧭";
+    if(/ingest|source|connector|collection|dataset/.test(s))return"📥"; if(/identit/.test(s))return"🧩";
+    if(/profile|merge/.test(s))return"👤"; if(/segment|audience/.test(s))return"🎯";
+    if(/destination|activat/.test(s))return"🚀"; if(/governance|privacy|consent/.test(s))return"🛡️";
+    if(/monitor|quality/.test(s))return"📊"; if(/query|distiller/.test(s))return"🔎";
+    if(/journey|message|email|campaign/.test(s))return"✉️"; if(/advanced|ai|intelligen/.test(s))return"🤖";
+    return"📘";};
+  const shortLbl=m=>{const t=(m.title||m.theme||"").split(/[,&:]/)[0].trim();return t.length>22?t.slice(0,21)+"…":t;};
+  const smooth=pts=>{ if(pts.length<2)return""; let d=`M ${pts[0].x} ${pts[0].y}`;
+    for(let i=1;i<pts.length;i++){const p0=pts[i-1],p1=pts[i],mx=(p0.x+p1.x)/2,my=(p0.y+p1.y)/2;d+=` Q ${p0.x} ${p0.y} ${mx} ${my}`;}
+    d+=` L ${pts[n-1>=pts.length?pts.length-1:pts.length-1].x} ${pts[pts.length-1].y}`;return d;};
+  const pts=modules.map((_,i)=>pt(i));
+  const doneCount=modules.filter(m=>m.status==="done").length;
+  const activeIdx=modules.findIndex(m=>m.status==="active");
+  const progEnd=activeIdx>=0?activeIdx:doneCount-1;
+  const roadAll=smooth(pts);
+  const roadDone=progEnd>=1?smooth(pts.slice(0,progEnd+1)):"";
+  const selM=sel!=null?modules[sel]:null;
+  const col3=m=>m.status==="done"?[DONE,DONE_D]:m.status==="active"?[CUR,CUR_D]:[TODO,TODO_D];
+  return(
+    <div>
+      <style>{`
+        @keyframes lfmpop{0%{opacity:0;transform:scale(.3)}70%{transform:scale(1.12)}100%{opacity:1;transform:scale(1)}}
+        @keyframes lfmring{0%{transform:scale(.9);opacity:.7}70%{transform:scale(1.5);opacity:0}100%{opacity:0}}
+        @keyframes lfmbounce{0%,100%{transform:translate(-50%,0)}50%{transform:translate(-50%,-5px)}}
+        @keyframes lfmdash{to{stroke-dashoffset:-26}}
+        @keyframes lfmin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+        .lfm-lvl{position:absolute;width:${D}px;height:${D}px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+          font-size:30px;cursor:pointer;border:0;transition:transform .18s cubic-bezier(.2,1.5,.3,1);animation:lfmpop .5s cubic-bezier(.2,1.4,.3,1) both;z-index:2}
+        .lfm-lvl:hover{transform:translateY(-3px) scale(1.06)}
+        .lfm-lvl:active{transform:translateY(1px)}
+        .lfm-ring{position:absolute;width:${D}px;height:${D}px;border-radius:50%;border:3px solid ${CUR};animation:lfmring 1.8s ease-out infinite;z-index:1;pointer-events:none}
+        .lfm-lbl{position:absolute;text-align:center;font-size:11.5px;font-weight:500;color:${P.txt};width:132px;transform:translateX(-50%);z-index:2;line-height:1.3;pointer-events:none}
+        .lfm-sub{font-size:10.5px;color:${P.muted};font-weight:400}
+        .lfm-you{position:absolute;transform:translate(-50%,0);background:${CUR};border-radius:99px;padding:4px 12px 4px 4px;
+          display:flex;align-items:center;gap:8px;white-space:nowrap;z-index:4;animation:lfmbounce 1.6s ease-in-out infinite;box-shadow:0 4px 12px ${CUR}66}
+        .lfm-you:after{content:"";position:absolute;left:50%;bottom:-5px;transform:translateX(-50%);border:6px solid transparent;border-top-color:${CUR};border-bottom:0}
+        .lfm-badge{position:absolute;right:-2px;bottom:-2px;width:24px;height:24px;border-radius:50%;background:#fff;
+          display:flex;align-items:center;justify-content:center;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+        .lfm-road{stroke-dasharray:2 12;stroke-linecap:round;animation:lfmdash 1s linear infinite}
+        .lfm-tp{font-size:13.5px;color:${P.muted};padding:5px 0 5px 18px;position:relative;border-top:1px solid ${P.bfaint};animation:lfmin .3s ease both}
+      `}</style>
+
+      {/* header + progress */}
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:8,flexWrap:"wrap"}}>
+        <div style={{fontSize:17,fontWeight:600,color:P.txt}}>Your journey</div>
+        <div style={{flex:1,minWidth:120,height:9,background:P.bfaint,borderRadius:99,overflow:"hidden",maxWidth:280}}>
+          <div style={{width:`${n?Math.round(doneCount/n*100):0}%`,height:"100%",background:`linear-gradient(90deg,${DONE},#7bc23e)`,borderRadius:99,transition:"width .7s cubic-bezier(.2,1,.3,1)"}}/>
+        </div>
+        <div style={{fontSize:12.5,color:P.muted,fontWeight:500}}>{doneCount} of {n} complete</div>
+      </div>
+
+      {/* the trail */}
+      <div style={{position:"relative",width:CW,maxWidth:"100%",height:HEIGHT,margin:"0 auto"}}>
+        <svg viewBox={`0 0 ${CW} ${HEIGHT}`} style={{position:"absolute",inset:0,width:"100%",height:"100%",overflow:"visible"}} xmlns="http://www.w3.org/2000/svg">
+          <path d={roadAll} fill="none" stroke={dark?"#3a404a":"#e4e7ec"} strokeWidth="14" strokeLinecap="round"/>
+          {roadDone&&<path d={roadDone} fill="none" stroke={DONE} strokeWidth="14" strokeLinecap="round" strokeOpacity="0.9"/>}
+          {roadDone&&<path className="lfm-road" d={roadDone} fill="none" stroke="#fff" strokeWidth="3" strokeOpacity="0.7"/>}
+        </svg>
+        {modules.map((m,i)=>{
+          const p=pt(i),[c,cd]=col3(m),isCur=m.status==="active",isDone=m.status==="done",locked=!isCur&&!isDone;
+          const lblLeft=p.x, lblTop=p.y+D/2+8, side=Math.sin(i*0.9);
+          return(
+            <Fragment key={i}>
+              {isCur&&<div className="lfm-ring" style={{left:p.x-D/2,top:p.y-D/2}}/>}
+              {isCur&&<div className="lfm-you" style={{left:p.x,top:p.y-D/2-52}}>
+                <UserAvatarCircle emoji={profile?.avatar_emoji} color={profile?.avatar_color||profile?.color} persona={profile?.persona} alt={firstName} size={30}/>
+                <div style={{lineHeight:1.12}}>
+                  <div style={{fontSize:9,fontWeight:600,color:"#ffffffcc",letterSpacing:.4}}>YOU ARE HERE</div>
+                  <div style={{fontSize:12,fontWeight:600,color:"#fff"}}>{firstName}</div>
+                </div>
+              </div>}
+              <button className="lfm-lvl" onClick={()=>setSel(sel===i?null:i)} title={m.title}
+                style={{left:p.x-D/2,top:p.y-D/2,animationDelay:`${i*0.06}s`,
+                  background:`radial-gradient(circle at 50% 32%, ${c}, ${cd})`,
+                  boxShadow:`0 5px 0 ${cd}, 0 9px 16px rgba(0,0,0,.18)${sel===i?`, 0 0 0 3px ${P.txt}`:""}`,
+                  opacity:locked?.82:1,filter:locked?"saturate(.7)":"none"}}>
+                <span style={{filter:isDone?"none":"none",lineHeight:1}}>{isDone?"":icon(m)}</span>
+                {isDone&&<span style={{position:"absolute",color:"#fff",fontSize:32,fontWeight:700,textShadow:"0 1px 2px rgba(0,0,0,.25)"}}>✓</span>}
+                {locked&&<span className="lfm-badge">🔒</span>}
+              </button>
+              <div className="lfm-lbl" style={{left:lblLeft,top:lblTop}}>
+                {shortLbl(m)}<br/><span className="lfm-sub">{m.week?("Week "+m.week):("Module "+m.id)}</span>
+              </div>
+            </Fragment>
+          );
+        })}
+      </div>
+
+      {/* detail card */}
+      {selM&&<div style={{marginTop:14,background:P.surface,border:`1px solid ${P.border}`,borderRadius:14,padding:"16px 18px",animation:"lfmin .3s ease both",maxWidth:CW,marginLeft:"auto",marginRight:"auto"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:3}}>
+          <div style={{fontSize:26}}>{selM.status==="done"?"✅":icon(selM)}</div>
+          <div style={{fontSize:16,fontWeight:600,color:P.txt}}>{selM.title}</div>
+          <span style={{fontSize:11,fontWeight:600,padding:"2px 10px",borderRadius:99,color:"#fff",background:col3(selM)[0]}}>{selM.status==="done"?"Completed":selM.status==="active"?"In progress":"Upcoming"}</span>
+        </div>
+        <div style={{fontSize:12.5,color:P.muted,marginBottom:10}}>{selM.week?("Week "+selM.week):("Module "+selM.id)}{selM.theme?" · "+selM.theme:""}{selM.topics?" · "+selM.topics.length+" topics":""}</div>
+        {(selM.topics||[]).map((t,j)=>(<div key={j} className="lfm-tp" style={{animationDelay:`${j*0.03}s`}}>{t}</div>))}
+        {onOpenLesson&&<button onClick={()=>onOpenLesson(selM)} style={{marginTop:14,background:col3(selM)[0],color:"#fff",border:"none",borderRadius:10,padding:"9px 18px",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",boxShadow:`0 3px 0 ${col3(selM)[1]}`}}>{selM.status==="done"?"Review module →":selM.status==="active"?"Continue →":"Open module →"}</button>}
+      </div>}
+    </div>
+  );
+}
+
 function LearningPathView({profile:p,groqKey,done,studyModule,setStudyModule,expandedModule,setExpandedModule,mobile,track="rtcdp",modules=MODULES,onTestOutPass=null,onConfUpdate=null,onOpenLesson=null}){
   const [sub,setSub]=useState("overview");
   const [testedOutIds,setTestedOutIds]=useState([]); // module ids passed via test-out (>=90%), persisted in DB
@@ -4717,13 +4966,20 @@ ONLY refer to the modules listed above. Never invent module names. Keep your ans
       </div>
       {/* Sub-tab bar */}
       <div style={{display:"flex",borderBottom:`1px solid ${P.border}`,padding:"0 clamp(12px,2vw,24px)",flexShrink:0,background:P.panel}}>
-        {[{id:"overview",l:"Overview"},{id:"modules",l:"All Modules ("+modules.length+")"},{id:"agent",l:"Curriculum Agent"}].map(t=>(
+        {[{id:"overview",l:"Overview"},{id:"flow",l:"Flow map"},{id:"modules",l:"All Modules ("+modules.length+")"},{id:"agent",l:"Curriculum Agent"}].map(t=>(
           <button key={t.id} onClick={()=>setSub(t.id)}
             style={{padding:"10px 16px",background:"transparent",border:"none",borderBottom:sub===t.id?`2px solid ${ACCENT}`:"2px solid transparent",color:sub===t.id?hACC:P.muted,fontWeight:sub===t.id?600:400,fontSize:13,cursor:"pointer",fontFamily:"inherit",marginBottom:-1,whiteSpace:"nowrap"}}>
             {t.l}
           </button>
         ))}
       </div>
+
+      {/* ── Flow map ── */}
+      {sub==="flow"&&<div style={{flex:1,overflowY:"auto",padding:"clamp(14px,2vw,24px)"}}>
+        <div style={{maxWidth:760,margin:"0 auto"}}>
+          <LearningFlowMap modules={effectiveModules} profile={p} onOpenLesson={onOpenLesson}/>
+        </div>
+      </div>}
 
       {/* ── Overview ── */}
       {sub==="overview"&&<div style={{flex:1,overflowY:"auto",padding:"clamp(14px,2vw,24px)"}}>
@@ -6710,6 +6966,7 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
     {id:"tracker",    label:"Weekly Tracker",    icon:Calendar},
     {id:"projects",   label:"My Projects",       icon:Briefcase},
     {id:"relnotes",   label:"Release Notes",      icon:FileText},
+    {id:"community",  label:"Community",         icon:CommunityIcon},
     {id:"profile",    label:"Profile",           icon:User},
   ];
   const {mobile}=useViewport();
@@ -6744,7 +7001,7 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
         // sections so it's clear which tiles are a real agent session.
         const agentCards=[
           {id:"track",cat:"Curriculum agent",label:"Learning Path",meta:`${done}/${totalN} modules done`,desc:"Continue your onboarding modules step by step.",color:P.blue},
-          {id:"assist",cat:"Reasoning + Socratic agent",label:"AI Tutor",meta:"Guided Q&A",desc:"Ask questions and get guided help on any AEP concept.",color:P.purple},
+          {id:"assist",cat:"AI Tutor",label:"AI Tutor",meta:"Guide me · Explain fully",desc:"Ask anything about AEP — choose hints to reason it out, or a full explanation.",color:P.purple},
           {id:"shadow",cat:"Practice agent",label:"Practice Scenarios",meta:"Realistic AEP situations",desc:"Apply your skills in a safe, guided environment.",color:P.amber},
           {id:"capstone",cat:"Capstone agent",label:"Capstone",meta:isAboveGate?"Unlocked":`${confPct}% confidence`,desc:"Prove readiness with a scenario-based final project.",color:P.blue},
         ];
@@ -7375,7 +7632,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
     </div>
   );
 
-  const tabs=[{id:"home",label:"Home",icon:Home},{id:"track",label:"Learning Path",icon:Education},{id:"assist",label:"AI Tutor",icon:Chat},{id:"capstone",label:"Capstone",icon:Ribbon},{id:"shadow",label:"Practice Scenarios",icon:Target},{id:"relnotes",label:"Release Notes",icon:FileText},{id:"projects",label:"Projects",icon:Briefcase},{id:"tracker",label:"Weekly Tracker",icon:Calendar},{id:"agent",label:"AI Advisor",icon:Chat},{id:"profile",label:"Profile",icon:User}];
+  const tabs=[{id:"home",label:"Home",icon:Home},{id:"track",label:"Learning Path",icon:Education},{id:"assist",label:"AI Tutor",icon:Chat},{id:"capstone",label:"Capstone",icon:Ribbon},{id:"shadow",label:"Practice Scenarios",icon:Target},{id:"relnotes",label:"Release Notes",icon:FileText},{id:"projects",label:"Projects",icon:Briefcase},{id:"tracker",label:"Weekly Tracker",icon:Calendar},{id:"community",label:"Community",icon:CommunityIcon},{id:"agent",label:"AI Advisor",icon:Chat},{id:"profile",label:"Profile",icon:User}];
   const {mobile}=useViewport();
   // Real data only — the learner's own assessed level, not a fabricated
   // "market demand"/"team average" comparison (removed; there was no real
@@ -7628,7 +7885,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
         // an actual agent session vs a static feature.
         const agentCards=[
           {id:"track",cat:"Curriculum agent",label:"Learning Path",meta:`${primaryModDone}/${primaryModCount} modules done`,desc:"Continue your enablement or a cross-skill track you've started.",color:P.blue},
-          {id:"assist",cat:"Reasoning + Socratic agent",label:"AI Tutor",meta:"Guided Q&A",desc:"Ask questions and get guided help on any AEP concept.",color:P.purple},
+          {id:"assist",cat:"AI Tutor",label:"AI Tutor",meta:"Guide me · Explain fully",desc:"Ask anything about AEP — choose hints to reason it out, or a full explanation.",color:P.purple},
           {id:"agent",cat:"Cross-Skilling agent",label:"AI Advisor",meta:"Skill-map grounded",desc:"Ask about upskilling paths based on your role's skill map.",color:P.red},
           {id:"shadow",cat:"Practice agent",label:"Practice Scenarios",meta:"Realistic AEP situations",desc:"Apply your skills in a safe, guided environment.",color:P.amber},
           {id:"capstone",cat:"Capstone agent",label:"Capstone",meta:primaryDone?(liveConf>=CAPSTONE_CONFIDENCE_GATE?"Unlocked":"Locked"):`${Math.round((liveConf||0)*100)}% confidence`,desc:"Prove readiness with a scenario-based final project.",color:P.blue},
@@ -7813,7 +8070,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
       </div>}
       {tab==="kb"&&<div style={{height:"calc(100vh - 54px)",overflowY:"auto"}}><KnowledgeBase groqKey={groqKey} track={chosenCrossTrack?.id||getTrack(p)} /></div>}
       {tab==="relnotes"&&<div style={{height:"calc(100vh - 54px)",overflowY:"auto"}}><ReleaseNotes/></div>}
-      {tab==="community"&&<Community userName={p.name}/>}
+      {tab==="community"&&<Community profile={p}/>}
       {tab==="projects"&&<MyProjectsView profile={p}/>}
       {tab==="tracker"&&<MyWeeklyTracker profile={p}/>}
       {tab==="agent"&&<div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 104px)"}}>

@@ -913,6 +913,30 @@ def create_all_tables():
                 author_name VARCHAR(150) NOT NULL,
                 text TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW())""")
+            # ── Team community upgrade: manager-scoped feed with visibility,
+            # a post body, and @mentions. Added additively so the existing
+            # nj/exp space feeds keep working (visibility defaults to 'team').
+            #   visibility: 'private' (author only) | 'team' (same manager) | 'public' (all teams)
+            for _col, _ddl in [
+                ("author_email",  "VARCHAR(150)"),
+                ("manager_email", "VARCHAR(150)"),
+                ("visibility",    "VARCHAR(20) DEFAULT 'team'"),
+                ("body",          "TEXT"),
+                ("mentions",      "JSONB DEFAULT '[]'"),
+            ]:
+                c.execute(f"ALTER TABLE community_threads ADD COLUMN IF NOT EXISTS {_col} {_ddl}")
+            # notifications: add link back to the thread so a click can deep-link.
+            c.execute("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS thread_id INTEGER")
+            c.execute("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS actor VARCHAR(150)")
+            # ── Kudos reactions — one 👍 per person per thread. Scoring rewards
+            # reactions RECEIVED (usefulness) rather than raw post volume, so the
+            # leaderboard can't be farmed by low-value posting.
+            c.execute("""CREATE TABLE IF NOT EXISTS community_reactions (
+                id SERIAL PRIMARY KEY,
+                thread_id INTEGER NOT NULL REFERENCES community_threads(id) ON DELETE CASCADE,
+                member_name VARCHAR(150) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(thread_id, member_name))""")
             # ── Release notes cache — replaces the hardcoded, frozen RELEASE_NOTES
             # frontend object. Populated by parsing each product's REAL release-notes
             # page from its AdobeDocs GitHub repo (see fetch_release_notes()); refetched
@@ -1286,15 +1310,31 @@ def get_manager_alias(as_email: str = ""):
 # from real rows, never stored/fabricated. `space` is "nj" (new-joiner cohort)
 # or "exp" (experienced-team community) — the two UIs that already existed.
 class CommunityThreadCreate(BaseModel):
-    space: str
+    space: str = "team"
     author_name: str
+    author_email: Optional[str] = None
+    manager_email: Optional[str] = None
     title: str
+    body: Optional[str] = None
     tag: str = "General"
     product: Optional[str] = None
+    visibility: str = "team"           # private | team | public
+    mentions: List[dict] = []          # [{name, email}] of people tagged
 
 class CommunityReplyCreate(BaseModel):
     author_name: str
+    author_email: Optional[str] = None
     text: str
+    mentions: List[dict] = []
+
+
+def _notify(cur, member_name, ntype, title, message, actor=None, thread_id=None, manager=None):
+    """Insert one notification row. Never notifies a blank/None recipient."""
+    if not member_name:
+        return
+    cur.execute("""INSERT INTO notifications (member_name, manager, type, title, message, actor, thread_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (member_name, manager, ntype, title, message, actor, thread_id))
 
 def _community_streak(cur, space: str, author_name: str) -> int:
     """Consecutive days (ending today or the most recent activity day) the
@@ -1323,19 +1363,46 @@ def _community_streak(cur, space: str, author_name: str) -> int:
     return streak
 
 @app.get("/api/community/threads")
-def list_community_threads(space: str, tag: str = None, product: str = None):
+def list_community_threads(space: str = None, tag: str = None, product: str = None,
+                           as_name: str = None, as_email: str = None, my_manager: str = None):
+    """Visibility-aware community feed.
+
+    Legacy mode (space=nj|exp, no viewer identity): returns that space's threads
+    unchanged, so the old NJ/EXP UIs keep working.
+
+    Team-feed mode (viewer identity via as_name/as_email + my_manager): returns
+    everything the viewer is allowed to see —
+      • public   → all teams
+      • team     → posts whose manager_email == the viewer's manager
+      • private  → only the viewer's own posts
+    """
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                clauses, params = ["space=%s"], [space]
+                clauses, params = [], []
+                viewer_feed = bool(as_name or as_email)
+                if viewer_feed:
+                    vis = ["visibility='public'"]
+                    if my_manager:
+                        vis.append("(visibility='team' AND lower(manager_email)=lower(%s))"); params.append(my_manager)
+                    own = []
+                    if as_email: own.append("lower(author_email)=lower(%s)"); params.append(as_email)
+                    if as_name:  own.append("lower(author_name)=lower(%s)"); params.append(as_name)
+                    if own:
+                        vis.append("(visibility='private' AND ("+" OR ".join(own)+"))")
+                    clauses.append("("+" OR ".join(vis)+")")
+                elif space:
+                    clauses.append("space=%s"); params.append(space)
                 if tag and tag != "All":
                     clauses.append("tag=%s"); params.append(tag)
                 if product and product != "All":
                     clauses.append("product=%s"); params.append(product)
-                cur.execute(f"SELECT id, author_name, title, tag, product, created_at "
-                           f"FROM community_threads WHERE {' AND '.join(clauses)} "
-                           f"ORDER BY created_at DESC", tuple(params))
+                where = (" WHERE "+" AND ".join(clauses)) if clauses else ""
+                cur.execute("SELECT id, author_name, author_email, manager_email, title, body, tag, "
+                           "product, visibility, mentions, created_at "
+                           f"FROM community_threads{where} ORDER BY created_at DESC LIMIT 200", tuple(params))
                 threads = [dict(r) for r in cur.fetchall()]
+                me = as_name or ""
                 for t in threads:
                     t["created_at"] = str(t["created_at"])
                     cur.execute("SELECT author_name, text, created_at FROM community_replies "
@@ -1343,6 +1410,13 @@ def list_community_threads(space: str, tag: str = None, product: str = None):
                     t["replies"] = [dict(r) for r in cur.fetchall()]
                     for rep in t["replies"]:
                         rep["created_at"] = str(rep["created_at"])
+                    cur.execute("SELECT COUNT(*) AS c FROM community_reactions WHERE thread_id=%s", (t["id"],))
+                    t["reactions"] = cur.fetchone()["c"]
+                    if me:
+                        cur.execute("SELECT 1 FROM community_reactions WHERE thread_id=%s AND member_name=%s", (t["id"], me))
+                        t["reacted"] = bool(cur.fetchone())
+                    else:
+                        t["reacted"] = False
         return {"threads": threads}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1351,16 +1425,36 @@ def list_community_threads(space: str, tag: str = None, product: str = None):
 def create_community_thread(body: CommunityThreadCreate):
     if not body.title.strip():
         raise HTTPException(status_code=422, detail="title is required.")
+    vis = body.visibility if body.visibility in ("private", "team", "public") else "team"
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("""INSERT INTO community_threads (space, author_name, title, tag, product)
-                              VALUES (%s,%s,%s,%s,%s)
-                              RETURNING id, author_name, title, tag, product, created_at""",
-                           (body.space, body.author_name, body.title.strip(), body.tag, body.product))
+                cur.execute("""INSERT INTO community_threads
+                              (space, author_name, author_email, manager_email, title, body, tag, product, visibility, mentions)
+                              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                              RETURNING id, author_name, author_email, manager_email, title, body, tag, product, visibility, mentions, created_at""",
+                           (body.space, body.author_name, body.author_email, body.manager_email,
+                            body.title.strip(), (body.body or "").strip() or None, body.tag, body.product,
+                            vis, json.dumps(body.mentions or [])))
                 t = dict(cur.fetchone())
+                tid = t["id"]
                 t["created_at"] = str(t["created_at"])
                 t["replies"] = []
+                # ── Notifications ──
+                # 1) @mentions (any visibility) — notify each tagged person.
+                for m in (body.mentions or []):
+                    nm = (m.get("name") if isinstance(m, dict) else None)
+                    if nm and nm != body.author_name:
+                        _notify(cur, nm, "mention", f"{body.author_name} mentioned you",
+                                body.title.strip()[:140], actor=body.author_name, thread_id=tid, manager=body.manager_email)
+                # 2) public post — light "new public post" notice to everyone else in the directory.
+                if vis == "public":
+                    cur.execute("""SELECT DISTINCT TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS nm
+                                   FROM employee_directory WHERE is_active=TRUE""")
+                    for (nm,) in cur.fetchall():
+                        if nm and nm != body.author_name:
+                            _notify(cur, nm, "public_post", f"{body.author_name} posted to all teams",
+                                    body.title.strip()[:140], actor=body.author_name, thread_id=tid)
         return {"ok": True, "thread": t}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1372,19 +1466,103 @@ def create_community_reply(thread_id: int, body: CommunityReplyCreate):
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT id FROM community_threads WHERE id=%s", (thread_id,))
-                if not cur.fetchone():
+                cur.execute("SELECT author_name, title, manager_email FROM community_threads WHERE id=%s", (thread_id,))
+                thread = cur.fetchone()
+                if not thread:
                     raise HTTPException(status_code=404, detail="Thread not found.")
                 cur.execute("""INSERT INTO community_replies (thread_id, author_name, text)
                               VALUES (%s,%s,%s) RETURNING author_name, text, created_at""",
                            (thread_id, body.author_name, body.text.strip()))
                 r = dict(cur.fetchone())
                 r["created_at"] = str(r["created_at"])
+                # Notify the post's author that someone replied (not on self-reply).
+                if thread["author_name"] and thread["author_name"] != body.author_name:
+                    _notify(cur, thread["author_name"], "reply", f"{body.author_name} replied to your post",
+                            (thread["title"] or "")[:140], actor=body.author_name, thread_id=thread_id,
+                            manager=thread["manager_email"])
+                # Notify anyone @mentioned in the reply.
+                for m in (body.mentions or []):
+                    nm = (m.get("name") if isinstance(m, dict) else None)
+                    if nm and nm != body.author_name:
+                        _notify(cur, nm, "mention", f"{body.author_name} mentioned you in a reply",
+                                (thread["title"] or "")[:140], actor=body.author_name, thread_id=thread_id)
         return {"ok": True, "reply": r}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Notifications list/read endpoints already exist further down (get_notifications
+# + PUT mark-read / read-all, used by NotificationsWidget). The community feature
+# reuses them; new rows are written via _notify() with the standard columns those
+# endpoints return, so nothing extra is needed here.
+
+@app.get("/api/community/members")
+def community_members(manager_email: str = None, q: str = None):
+    """People available to @mention — the manager's team (same manager_email),
+    plus the manager. Used by the compose box's mention autocomplete."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                clauses, params = ["is_active=TRUE"], []
+                if manager_email:
+                    clauses.append("lower(manager_email)=lower(%s)"); params.append(manager_email)
+                cur.execute(f"""SELECT DISTINCT TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')) AS name, email
+                               FROM employee_directory WHERE {' AND '.join(clauses)}
+                               ORDER BY name LIMIT 200""", tuple(params))
+                people = [dict(r) for r in cur.fetchall() if r["name"]]
+                if q:
+                    ql = q.lower()
+                    people = [x for x in people if ql in (x["name"] or "").lower()]
+        return {"members": people}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── Community scoring — quality over quantity ────────────────────────────────
+# Posting is worth little on its own (can be farmed); the real driver is
+# reactions RECEIVED — i.e. other people found your post useful. Kept small and
+# simple so it motivates helpfulness without turning the feed into point-farming.
+PTS_POST, PTS_REPLY, PTS_KUDOS_RECEIVED = 2, 3, 5
+
+class CommunityReact(BaseModel):
+    member_name: str
+
+@app.post("/api/community/threads/{thread_id}/react")
+def toggle_community_reaction(thread_id: int, body: CommunityReact):
+    """Toggle a 👍 kudos on a post. Returns the new count + whether the caller
+    now has one active. Notifies the post author on a fresh kudos."""
+    if not body.member_name:
+        raise HTTPException(status_code=422, detail="member_name required.")
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT author_name, title, manager_email FROM community_threads WHERE id=%s", (thread_id,))
+                thread = cur.fetchone()
+                if not thread:
+                    raise HTTPException(status_code=404, detail="Thread not found.")
+                cur.execute("DELETE FROM community_reactions WHERE thread_id=%s AND member_name=%s RETURNING id",
+                            (thread_id, body.member_name))
+                removed = cur.fetchone()
+                reacted = False
+                if not removed:
+                    cur.execute("INSERT INTO community_reactions (thread_id, member_name) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                                (thread_id, body.member_name))
+                    reacted = True
+                    if thread["author_name"] and thread["author_name"] != body.member_name:
+                        _notify(cur, thread["author_name"], "kudos", f"{body.member_name} gave your post kudos 👍",
+                                (thread["title"] or "")[:140], actor=body.member_name, thread_id=thread_id,
+                                manager=thread["manager_email"])
+                cur.execute("SELECT COUNT(*) AS c FROM community_reactions WHERE thread_id=%s", (thread_id,))
+                count = cur.fetchone()["c"]
+        return {"ok": True, "reacted": reacted, "reactions": count}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def _score(posts, replies, kudos_received):
+    return posts * PTS_POST + replies * PTS_REPLY + kudos_received * PTS_KUDOS_RECEIVED
 
 @app.get("/api/community/stats")
 def community_stats(space: str, author_name: str):
@@ -1398,33 +1576,38 @@ def community_stats(space: str, author_name: str):
                               JOIN community_threads t ON t.id=r.thread_id
                               WHERE t.space=%s AND r.author_name=%s""", (space, author_name))
                 replies = cur.fetchone()[0]
+                # kudos received across ALL this author's posts (any space) — usefulness signal
+                cur.execute("""SELECT COUNT(*) FROM community_reactions x
+                              JOIN community_threads t ON t.id=x.thread_id
+                              WHERE t.author_name=%s""", (author_name,))
+                kudos = cur.fetchone()[0]
                 streak = _community_streak(cur, space, author_name)
-        return {"points": posts * 15 + replies * 5, "posts": posts, "replies": replies, "streak": streak}
+        return {"points": _score(posts, replies, kudos), "posts": posts, "replies": replies,
+                "kudos": kudos, "streak": streak}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/community/leaderboard")
 def community_leaderboard(space: str):
-    """Real leaderboard — only people who have actually posted/replied in this
-    space, ranked by computed points. No fictional filler rows."""
+    """Real leaderboard ranked by the quality-weighted score (reactions received
+    dominate). Only people who have actually participated appear."""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT author_name, COUNT(*) AS posts FROM community_threads
-                    WHERE space=%s GROUP BY author_name""", (space,))
+                cur.execute("SELECT author_name, COUNT(*) AS posts FROM community_threads WHERE space=%s GROUP BY author_name", (space,))
                 posts_by = {r[0]: r[1] for r in cur.fetchall()}
-                cur.execute("""
-                    SELECT r.author_name, COUNT(*) AS replies FROM community_replies r
-                    JOIN community_threads t ON t.id=r.thread_id
-                    WHERE t.space=%s GROUP BY r.author_name""", (space,))
+                cur.execute("""SELECT r.author_name, COUNT(*) AS replies FROM community_replies r
+                    JOIN community_threads t ON t.id=r.thread_id WHERE t.space=%s GROUP BY r.author_name""", (space,))
                 replies_by = {r[0]: r[1] for r in cur.fetchall()}
-                names = set(posts_by) | set(replies_by)
+                cur.execute("""SELECT t.author_name, COUNT(*) AS k FROM community_reactions x
+                    JOIN community_threads t ON t.id=x.thread_id WHERE t.space=%s GROUP BY t.author_name""", (space,))
+                kudos_by = {r[0]: r[1] for r in cur.fetchall()}
+                names = set(posts_by) | set(replies_by) | set(kudos_by)
                 board = []
                 for n in names:
-                    p, r = posts_by.get(n, 0), replies_by.get(n, 0)
-                    board.append({"name": n, "posts": p, "replies": r, "points": p * 15 + r * 5,
-                                 "streak": _community_streak(cur, space, n)})
+                    p, r, k = posts_by.get(n, 0), replies_by.get(n, 0), kudos_by.get(n, 0)
+                    board.append({"name": n, "posts": p, "replies": r, "kudos": k,
+                                 "points": _score(p, r, k), "streak": _community_streak(cur, space, n)})
                 board.sort(key=lambda x: x["points"], reverse=True)
         return {"leaderboard": board}
     except Exception as e:
