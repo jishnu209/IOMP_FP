@@ -1528,8 +1528,13 @@ function MyPointsWidget({profile:p,modulesDone,capstoneCompleted,refreshKey=0}){
 // ── Profile settings — avatar, username, password change. Real accounts only ──
 function ProfileSettingsCard({email,accountType,currentUsername,currentEmoji,currentColor,fallbackColor,onSaved}){
   const [open,setOpen]=useState(false);
-  const [emojis,setEmojis]=useState(["🦊","🐼","🚀","🎯","⚡","🌟","🔥","💡","🎨","🧠","🦉","🐙","🌈","🍀","🎮","🛰️","🧩","🦋","🐢","🦄"]);
-  const [colors,setColors]=useState(["#1473E6","#E34850","#12805C","#B86B00","#6030D0","#0891B2","#097348","#9B1C2E","#2357E8","#D6409F"]);
+  const [emojis,setEmojis]=useState([
+    "🦊","🐼","🐧","🦁","🐨","🐯","🦉","🐙","🦋","🐢","🦄","🐬","🦎","🐝","🦕","🐳","🦈","🦖","🐺","🦩",
+    "🚀","🛰️","🎯","⚡","🌟","🔥","💡","🎨","🧠","🎮","🧩","🌈","🍀","🎧","📚","🔭","🧪","♟️","🏆","🎲",
+    "🌸","🍕","🍩","☕","🌵","🍄","🪐","💎","🎸","⚽"]);
+  const [colors,setColors]=useState([
+    "#1473E6","#E34850","#12805C","#B86B00","#6030D0","#0891B2","#097348","#9B1C2E","#2357E8","#D6409F",
+    "#0D9488","#DC2626","#7C3AED","#EA580C","#0369A1","#4D7C0F","#BE185D","#475569","#CA8A04","#15803D"]);
   const [username,setUsername]=useState(currentUsername||"");
   const [emoji,setEmoji]=useState(currentEmoji||"");
   const [swatch,setSwatch]=useState(currentColor||fallbackColor);
