@@ -4631,14 +4631,20 @@ function computeEffectiveModules(modules,completedIds){
 // completed = green with a check, current = pulsing "you are here", locked = grey.
 // Click a node to open its topics. HTML nodes over one SVG road (no innerHTML).
 function LearningFlowMap({modules=[],profile=null,onOpenLesson=null}){
-  const [sel,setSel]=useState(null);
+  // Default the detail panel to the current (active) phase so the view isn't
+  // empty — falls back to the first module if nothing is active yet.
+  const [sel,setSel]=useState(()=>{const a=modules.findIndex(m=>m.status==="active");return a>=0?a:(modules.length?0:null);});
   const dark=getThemeMode()==="dark";
   const firstName=profile?.name?.split(" ")[0]||"You";
   const n=modules.length;
-  const CW=470,cx=CW/2,AMP=118,STEP=162,TOP=58,D=70;
-  const HEIGHT=TOP+(Math.max(1,n)-1)*STEP+D/2+72;
+  // Horizontal winding trail: nodes march left→right, y oscillates. The trail
+  // gets wide with many phases, so its wrapper scrolls horizontally.
+  const MX=40,D=84,STEP_X=210,AMP=84,TOPPAD=72;
+  const MIDY=TOPPAD+AMP+D/2;
+  const TOTAL=MX*2+D+(Math.max(1,n)-1)*STEP_X;
+  const HEIGHT=MIDY+AMP+D/2+58;
   const DONE="#5aa02a",DONE_D="#437a1e",CUR="#2f7fd6",CUR_D="#215d9e",TODO=dark?"#4a515c":"#c4cad2",TODO_D=dark?"#3a404a":"#aab1ba";
-  const pt=i=>({x:cx+AMP*Math.sin(i*0.9),y:TOP+i*STEP});
+  const pt=i=>({x:MX+D/2+i*STEP_X,y:MIDY+AMP*Math.sin(i*0.9)});
   const icon=m=>{const s=((m.tag||"")+" "+(m.title||"")+" "+(m.theme||"")).toLowerCase();
     if(/capstone|certif/.test(s))return"🏆"; if(/foundation|architect|overview|intro/.test(s))return"🧭";
     if(/ingest|source|connector|collection|dataset/.test(s))return"📥"; if(/identit/.test(s))return"🧩";
@@ -4692,9 +4698,10 @@ function LearningFlowMap({modules=[],profile=null,onOpenLesson=null}){
         <div style={{fontSize:12.5,color:P.muted,fontWeight:500}}>{doneCount} of {n} complete</div>
       </div>
 
-      {/* the trail */}
-      <div style={{position:"relative",width:CW,maxWidth:"100%",height:HEIGHT,margin:"0 auto"}}>
-        <svg viewBox={`0 0 ${CW} ${HEIGHT}`} style={{position:"absolute",inset:0,width:"100%",height:"100%",overflow:"visible"}} xmlns="http://www.w3.org/2000/svg">
+      {/* the trail — horizontal, scrolls right when there are many phases */}
+      <div style={{width:"100%",overflowX:"auto",overflowY:"hidden",paddingBottom:6}}>
+      <div style={{position:"relative",width:TOTAL,height:HEIGHT,margin:0,minWidth:"100%"}}>
+        <svg viewBox={`0 0 ${TOTAL} ${HEIGHT}`} style={{position:"absolute",inset:0,width:"100%",height:"100%",overflow:"visible"}} xmlns="http://www.w3.org/2000/svg">
           <path d={roadAll} fill="none" stroke={dark?"#3a404a":"#e4e7ec"} strokeWidth="14" strokeLinecap="round"/>
           {roadDone&&<path d={roadDone} fill="none" stroke={DONE} strokeWidth="14" strokeLinecap="round" strokeOpacity="0.9"/>}
           {roadDone&&<path className="lfm-road" d={roadDone} fill="none" stroke="#fff" strokeWidth="3" strokeOpacity="0.7"/>}
@@ -4728,9 +4735,21 @@ function LearningFlowMap({modules=[],profile=null,onOpenLesson=null}){
           );
         })}
       </div>
+      </div>
+
+      {/* legend + hint */}
+      <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap",marginTop:6,paddingTop:12,borderTop:`1px solid ${P.bfaint}`}}>
+        {[["Completed",DONE],["Current",CUR],["Locked",TODO]].map(([l,c])=>(
+          <span key={l} style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12,color:P.muted}}>
+            <span style={{width:11,height:11,borderRadius:99,background:c}}/>{l}
+          </span>
+        ))}
+        <span style={{flex:1}}/>
+        <span style={{fontSize:11.5,color:P.dim}}>Tap any stone to see its topics{n>4?" · scroll → for the full path":""}</span>
+      </div>
 
       {/* detail card */}
-      {selM&&<div style={{marginTop:14,background:P.surface,border:`1px solid ${P.border}`,borderRadius:14,padding:"16px 18px",animation:"lfmin .3s ease both",maxWidth:CW,marginLeft:"auto",marginRight:"auto"}}>
+      {selM&&<div style={{marginTop:14,background:P.surface,border:`1px solid ${P.border}`,borderRadius:14,padding:"16px 18px",animation:"lfmin .3s ease both"}}>
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:3}}>
           <div style={{fontSize:26}}>{selM.status==="done"?"✅":icon(selM)}</div>
           <div style={{fontSize:16,fontWeight:600,color:P.txt}}>{selM.title}</div>
@@ -4975,8 +4994,8 @@ ONLY refer to the modules listed above. Never invent module names. Keep your ans
       </div>
 
       {/* ── Flow map ── */}
-      {sub==="flow"&&<div style={{flex:1,overflowY:"auto",padding:"clamp(14px,2vw,24px)"}}>
-        <div style={{maxWidth:760,margin:"0 auto"}}>
+      {sub==="flow"&&<div style={{flex:1,overflowY:"auto",padding:"clamp(14px,2vw,28px)"}}>
+        <div style={{width:"100%"}}>
           <LearningFlowMap modules={effectiveModules} profile={p} onOpenLesson={onOpenLesson}/>
         </div>
       </div>}
