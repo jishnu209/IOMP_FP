@@ -1703,6 +1703,61 @@ def community_leaderboard(space: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Remediation — a targeted catch-up path when a learner is struggling ───────
+@app.get("/api/curriculum/remediation")
+def curriculum_remediation(member_name: str, track: str = "rtcdp"):
+    """Detect weak areas (failed test-outs + low confidence) and return a
+    prioritised catch-up plan: which modules to revisit, why, and the
+    recommended actions (revisit lesson / Socratic drill / re-take test-out).
+    on_track=True with an empty plan means nothing needs remediation."""
+    LOW_CONF = float(os.getenv("REMEDIATION_CONF_THRESHOLD", "0.6"))
+    PASS_PCT = int(os.getenv("REMEDIATION_TESTOUT_PASS", "70"))
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Most recent FAILED test-out per module (strongest weakness signal).
+                cur.execute("""SELECT DISTINCT ON (module_id) module_id, module_title, score
+                               FROM module_test_outs
+                               WHERE member_name=%s AND track=%s AND passed=FALSE
+                               ORDER BY module_id, created_at DESC""", (member_name, track))
+                failed = {r["module_id"]: r for r in cur.fetchall()}
+                # Latest low-confidence score per module (keyed by module title/name).
+                cur.execute("""SELECT DISTINCT ON (module) module, score
+                               FROM confidence_scores WHERE user_name=%s
+                               ORDER BY module, created_at DESC""", (member_name,))
+                low_conf = {r["module"]: r["score"] for r in cur.fetchall()
+                            if r["score"] is not None and r["score"] < LOW_CONF and r["module"]}
+                # Map module titles -> module_id for this track (to attach actions).
+                cur.execute("SELECT DISTINCT module_id, title FROM curriculum_topics WHERE track=%s", (track,))
+                title_to_mid = {}
+                for r in cur.fetchall():
+                    title_to_mid.setdefault((r["title"] or "").lower(), r["module_id"])
+
+        plan, seen = [], set()
+        for mid, r in failed.items():
+            sc = r.get("score") or 0
+            plan.append({"module_id": mid, "module_title": r["module_title"],
+                         "kind": "failed_testout", "score": sc,
+                         "reason": f"Scored {sc}% on the test-out (needs {PASS_PCT}%+).",
+                         "severity": max(1, PASS_PCT - sc),
+                         "actions": ["revisit", "socratic", "retest"]})
+            seen.add(mid)
+        for mod_title, conf in low_conf.items():
+            mid = title_to_mid.get((mod_title or "").lower())
+            if mid in seen:
+                continue
+            plan.append({"module_id": mid, "module_title": mod_title,
+                         "kind": "low_confidence", "confidence": round(conf, 2),
+                         "reason": f"Confidence is {round(conf*100)}% (below {round(LOW_CONF*100)}%).",
+                         "severity": max(1, round((LOW_CONF - conf) * 100)),
+                         "actions": ["revisit", "socratic"]})
+        plan.sort(key=lambda x: x["severity"], reverse=True)
+        return {"member_name": member_name, "track": track,
+                "weak_count": len(plan), "on_track": len(plan) == 0, "plan": plan}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 import re
 import html
 import datetime as _dt

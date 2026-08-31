@@ -4668,6 +4668,50 @@ function computeEffectiveModules(modules,completedIds){
 // Inspired by Duolingo / BYJU's: big round level nodes snaking down a curved road,
 // completed = green with a check, current = pulsing "you are here", locked = grey.
 // Click a node to open its topics. HTML nodes over one SVG road (no innerHTML).
+// ── Remediation card — a targeted catch-up plan when a learner is struggling ──
+// Only shows for real signed-in users who have weak areas (failed test-outs or
+// low confidence). Sourced from /api/curriculum/remediation — the adaptive
+// "if I'm doing badly, give me a path" companion to the Curriculum agent.
+function RemediationCard({profile:p,track,modules=[],onOpenLesson=null}){
+  const [plan,setPlan]=useState(null);
+  useEffect(()=>{
+    if(!p?.name||!p?.id){setPlan(null);return;}
+    fetch(`${BACKEND}/api/curriculum/remediation?member_name=${encodeURIComponent(p.name)}&track=${track}`)
+      .then(r=>r.json()).then(setPlan).catch(()=>setPlan(null));
+  },[p?.name,p?.id,track]);
+  if(!p?.id||!plan||plan.on_track||!(plan.plan||[]).length)return null;
+  const go=tab=>window.dispatchEvent(new CustomEvent("nexus:navigate",{detail:{tab}}));
+  const revisit=item=>{const m=modules.find(x=>x.id===item.module_id);if(m&&onOpenLesson)onOpenLesson(m);else go("track");};
+  const ACT={revisit:{l:"Revisit lesson",fn:revisit},socratic:{l:"Socratic drill",fn:()=>go("assist")},retest:{l:"Re-take test-out",fn:()=>go("track")}};
+  return(
+    <div style={{background:P.amberBg,border:`1px solid ${P.amber}55`,borderRadius:14,padding:"16px 18px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:4}}>
+        <span style={{fontSize:18}}>🎯</span>
+        <div style={{fontSize:14,fontWeight:600,color:P.txt}}>Your catch-up plan</div>
+        <span style={{fontSize:11,fontWeight:600,color:P.amber,background:"#fff",borderRadius:99,padding:"1px 9px",border:`1px solid ${P.amber}55`}}>{plan.weak_count} to review</span>
+      </div>
+      <div style={{fontSize:12.5,color:P.muted,marginBottom:12}}>We spotted a few weak spots. Here's a focused path to get back on track — hardest first.</div>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {plan.plan.map((item,i)=>(
+          <div key={i} style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,padding:"12px 14px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:3}}>
+              <span style={{fontSize:12,fontWeight:600,color:P.dim,width:20,textAlign:"center"}}>{i+1}</span>
+              <span style={{fontSize:13.5,fontWeight:600,color:P.txt}}>{item.module_title||`Module ${item.module_id}`}</span>
+              <span style={{fontSize:10.5,fontWeight:600,color:item.kind==="failed_testout"?P.red:P.amber,background:(item.kind==="failed_testout"?P.red:P.amber)+"18",borderRadius:99,padding:"1px 8px"}}>{item.kind==="failed_testout"?"Failed test-out":"Low confidence"}</span>
+            </div>
+            <div style={{fontSize:12,color:P.muted,marginBottom:9,paddingLeft:28}}>{item.reason}</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",paddingLeft:28}}>
+              {(item.actions||[]).map(a=>ACT[a]&&(
+                <button key={a} onClick={()=>ACT[a].fn(item)} style={{fontSize:12,fontWeight:600,color:"#fff",background:P.blue,border:"none",borderRadius:7,padding:"6px 12px",cursor:"pointer",fontFamily:"inherit"}}>{ACT[a].l}</button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function LearningFlowMap({modules=[],profile=null,demo=false,onOpenLesson=null}){
   // Default the detail panel to the current (active) phase so the view isn't
   // empty — falls back to the first module if nothing is active yet.
@@ -5047,6 +5091,9 @@ ONLY refer to the modules listed above. Never invent module names. Keep your ans
 
       {/* ── Overview ── */}
       {sub==="overview"&&<div style={{flex:1,overflowY:"auto",padding:"clamp(14px,2vw,24px)"}}>
+        <div style={{maxWidth:900,margin:"0 auto 16px"}}>
+          <RemediationCard profile={p} track={track} modules={effectiveModules} onOpenLesson={onOpenLesson}/>
+        </div>
         <div style={{maxWidth:900,margin:"0 auto",display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:16}}>
 
           {/* Active module card */}
