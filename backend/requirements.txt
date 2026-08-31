@@ -67,3 +67,4 @@ langchain-openai==0.1.25
 openai==1.109.1
 datasets==5.0.1
 pandas==3.0.5
+pytest>=8.0
