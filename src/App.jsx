@@ -735,25 +735,26 @@ function KnowledgeBase({groqKey,track="rtcdp"}){
       {/* RAG results */}
       {results.length>0&&(
         <div style={{marginBottom:24}}>
-          <div style={{fontSize:11,fontWeight:600,color:P.dim,letterSpacing:.5,textTransform:"uppercase",marginBottom:10}}>Source documentation ({results.length} matches)</div>
+          <div style={{fontSize:11,fontWeight:600,color:P.dim,letterSpacing:.5,textTransform:"uppercase",marginBottom:10}}>Source documentation ({results.length} matches) · from the Nexus knowledge base</div>
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {results.map((doc,i)=>(
               <div key={i} style={{background:P.panel,border:`1px solid ${P.border}`,borderRadius:10,overflow:"hidden"}}>
+                {/* In-platform only — the full excerpt is shown here; no external
+                    redirect. The content lives in the Nexus knowledge base. */}
                 <div onClick={()=>setExpanded(expanded===i?null:i)}
                   style={{padding:"12px 16px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
                   <div style={{flex:1}}>
                     <div style={{fontSize:13.5,fontWeight:600,color:ACCTX,marginBottom:3}}>{doc.title||"AEP Documentation"}</div>
-                    <div style={{fontSize:12,color:P.muted}}>{doc.repo||""}{doc.url?" · ":""}{doc.url&&<span style={{color:P.dim}}>{doc.url.replace("https://experienceleague.adobe.com","EL")}</span>}</div>
+                    <div style={{fontSize:12,color:P.muted}}>{doc.repo||"Knowledge base"}</div>
                   </div>
                   <div style={{display:"flex",gap:8,alignItems:"center",flexShrink:0,marginLeft:12}}>
-                    {doc.url&&<a href={doc.url} target="_blank" rel="noreferrer" onClick={e=>e.stopPropagation()}
-                      style={{fontSize:11.5,color:ACCTX,fontWeight:600,textDecoration:"none",background:ACCBG,borderRadius:5,padding:"2px 8px"}}>Open</a>}
+                    <span style={{fontSize:11,color:P.dim}}>{expanded===i?"Hide":"Read"}</span>
                     <Ic as={expanded===i?ChevronUp:ChevronDown} size={15} color={P.muted}/>
                   </div>
                 </div>
                 {expanded===i&&doc.content&&(
                   <div style={{padding:"0 16px 14px",fontSize:12.5,color:P.muted,lineHeight:1.7,borderTop:`1px solid ${P.bfaint}`}}>
-                    <div style={{paddingTop:10}}>{doc.content.slice(0,500)}{doc.content.length>500?"…":""}</div>
+                    <div style={{paddingTop:10,whiteSpace:"pre-line"}}>{doc.content}</div>
                   </div>
                 )}
               </div>

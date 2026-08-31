@@ -1868,27 +1868,46 @@ def fetch_release_notes(product: str, max_entries: int = 8) -> list:
         gh_headers = {"User-Agent": "Nexus-Platform/1.0"}
         if GITHUB_TOKEN:
             gh_headers["Authorization"] = f"token {GITHUB_TOKEN}"
-        text = None
+        text, matched_path = None, None
         for path in paths:
             for branch in ("main", "master"):
                 r = requests.get(f"https://raw.githubusercontent.com/{repo}/{branch}/{path}",
                                  headers=gh_headers, timeout=20)
                 if r.status_code == 200:
-                    text = r.text
+                    text, matched_path = r.text, path
                     break
             if text:
                 break
         if not text:
             return []
-        # Split into sections by top-level "## heading" — each becomes the
-        # real "period" label shown with its entries (e.g. "## June 2026").
+        # ── Month resolution ──────────────────────────────────────────────────
+        # Products like AEP publish ONE file per month (…/august-2026.md) whose
+        # top-level "## headings" are feature CATEGORIES, not months — so the
+        # month has to come from the filename, otherwise the feed groups by
+        # "Destinations"/"Segmentation Service" instead of "August 2026".
+        # Products that publish one file per YEAR use "## Month Year" headings,
+        # so there the heading IS the month and we keep it.
+        _MONTHS = ("january","february","march","april","may","june","july",
+                   "august","september","october","november","december")
+        mm = re.search(r'(' + '|'.join(_MONTHS) + r')[-_ ](\d{4})', (matched_path or '').lower())
+        file_month = f"{mm.group(1).capitalize()} {mm.group(2)}" if mm else None
+        # A real, month-specific Experience League link when the GitHub path
+        # mirrors the EL structure (AEP) — beats the generic ".../latest".
+        url = src["el_url"]
+        if file_month and matched_path and "experience-platform" in repo:
+            sub = matched_path[5:] if matched_path.startswith("help/") else matched_path
+            if sub.endswith(".md"):
+                sub = sub[:-3]
+            url = f"https://experienceleague.adobe.com/en/docs/experience-platform/{sub}"
         parts = re.split(r'^##\s+(.+)$', text, flags=re.MULTILINE)
         sections = list(zip(parts[1::2], parts[2::2])) if len(parts) > 1 else [("", text)]
         out = []
         for heading, body in sections:
             period = _rn_clean(heading) or "Latest"
             for period2, title, desc in _rn_parse_section(period, body, max_entries=max_entries):
-                out.append((period2, title, desc, src["el_url"]))
+                # file_month (per-month files) always wins so the feed is month-wise;
+                # otherwise use the per-section period (a "Month Year" heading).
+                out.append((file_month or period2, title, desc, url))
             if len(out) >= max_entries:
                 break
         return out[:max_entries]
