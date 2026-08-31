@@ -4670,9 +4670,15 @@ function LearningFlowMap({modules=[],profile=null,demo=false,onOpenLesson=null})
   const dark=getThemeMode()==="dark";
   const firstName=profile?.name?.split(" ")[0]||"You";
   const n=modules.length;
-  // Horizontal winding trail: nodes march left→right, y oscillates. The trail
-  // gets wide with many phases, so its wrapper scrolls horizontally.
-  const MX=40,D=84,STEP_X=210,AMP=84,TOPPAD=72;
+  // Horizontal winding trail: nodes march left→right, y oscillates. Spacing is
+  // responsive to the measured container width so the trail fills the space
+  // (centered when there are few phases, horizontally scrollable when many).
+  const wrapRef=useRef(null);
+  const [cw,setCw]=useState(1000);
+  useEffect(()=>{const el=wrapRef.current;if(!el)return;const ro=new ResizeObserver(()=>setCw(el.clientWidth||1000));ro.observe(el);setCw(el.clientWidth||1000);return()=>ro.disconnect();},[]);
+  const MX=40,D=84,AMP=84,TOPPAD=72,MIN_STEP=200,MAX_STEP=300;
+  const stepFit=n>1?(cw-2*MX-D)/(n-1):0;
+  const STEP_X=Math.min(MAX_STEP,Math.max(MIN_STEP,stepFit));
   const MIDY=TOPPAD+AMP+D/2;
   const TOTAL=MX*2+D+(Math.max(1,n)-1)*STEP_X;
   const HEIGHT=MIDY+AMP+D/2+58;
@@ -4733,8 +4739,8 @@ function LearningFlowMap({modules=[],profile=null,demo=false,onOpenLesson=null})
       </div>
 
       {/* the trail — horizontal, scrolls right when there are many phases */}
-      <div style={{width:"100%",overflowX:"auto",overflowY:"hidden",paddingBottom:6}}>
-      <div style={{position:"relative",width:TOTAL,height:HEIGHT,margin:0,minWidth:"100%"}}>
+      <div ref={wrapRef} style={{width:"100%",overflowX:"auto",overflowY:"hidden",paddingBottom:6}}>
+      <div style={{position:"relative",width:TOTAL,height:HEIGHT,margin:TOTAL<=cw?"0 auto":0}}>
         <svg viewBox={`0 0 ${TOTAL} ${HEIGHT}`} style={{position:"absolute",inset:0,width:"100%",height:"100%",overflow:"visible"}} xmlns="http://www.w3.org/2000/svg">
           <path d={roadAll} fill="none" stroke={dark?"#3a404a":"#e4e7ec"} strokeWidth="14" strokeLinecap="round"/>
           {roadDone&&<path d={roadDone} fill="none" stroke={DONE} strokeWidth="14" strokeLinecap="round" strokeOpacity="0.9"/>}
