@@ -530,12 +530,15 @@ const PROFILES={
 // /api/community/* endpoints and the Community/NJCommunity components.
 // ── Knowledge Base — search any AEP concept, AI routes to right docs ─────────
 // ── Product release notes — monthly entries per product ──────────────────────
+// Only lists topics with real indexed coverage in doc_embeddings (verified
+// against the live index — AJO/CJA/WebSDK/etc. currently have ZERO chunks
+// ingested, so suggesting a search for them would just surface irrelevant
+// RTCDP citations dressed up as an answer instead of an honest "not indexed
+// yet"). Keep this list in sync with what's actually been ingested — add a
+// tag back once that product's docs are indexed, not before.
 const KB_CURATED=[
-  {tag:"AJO",       product:"ajo",     items:["Journey canvas & entry events","Email surface & deliverability","Frequency capping","Decision management & offers","Suppression lists","Push & SMS channels","Personalisation expressions","Journey reporting"]},
-  {tag:"CJA",       product:"cja",     items:["Connection setup","Data views & components","Calculated metrics","Attribution models","Cross-channel stitching","Workspace in CJA","B2B analytics","Sharing & governance"]},
-  {tag:"Analytics", product:"analytics",items:["Analysis Workspace","eVars, props & events","Report suites","Segmentation & containers","Calculated metrics","Attribution IQ","Data Warehouse","Analytics API 2.0"]},
-  {tag:"RTCDP",     product:"rtcdp",   items:["Identity namespaces","Profile fragments & merge","Audience activation","Destination setup","Batch vs streaming segmentation","Real-time profile lookup","Data governance labels","Federated Audience Composition"]},
-  {tag:"Data Ingestion", product:"rtcdp", items:["XDM schema design","Source connectors","Streaming HTTP API","Batch ingestion CSV","Profile-enabled datasets","Query Service","Data Prep mappings","Monitoring dashboard"]},
+  {tag:"RTCDP", product:"rtcdp", items:["Identity namespaces","Profile fragments & merge","Audience activation","Destination setup","Batch vs streaming segmentation","Real-time profile lookup","Data governance labels","Source connectors"]},
+  {tag:"Analytics", product:"analytics", items:["Analysis Workspace","Report suites","Segmentation & containers","Calculated metrics","Attribution models","Data Warehouse","Customer Journey Analytics overview"]},
 ];
 
 // Fallback link per product if a fetched entry is ever missing its own
@@ -711,8 +714,8 @@ function KnowledgeBase({groqKey,track="rtcdp"}){
         <div style={{fontSize:11,fontWeight:700,letterSpacing:1.2,textTransform:"uppercase",color:ACCTX,marginBottom:6}}>Knowledge Base</div>
         <div style={{fontSize:24,fontWeight:700,letterSpacing:-.5,color:P.txt,marginBottom:4}}>Search the docs</div>
         <div style={{fontSize:13,color:P.muted,marginBottom:14}}>
-          Search across AJO · CJA · Adobe Analytics · RTCDP · AEP
-          {track&&track!=="rtcdp"&&<span style={{color:ACCTX,fontWeight:600}}> · showing <strong>{TRACK_LABELS[track]||"AEP"}</strong> topics first</span>}
+          Search real, indexed AEP documentation — Real-Time CDP &amp; Adobe Analytics today; more products are added as they're indexed.
+          {track&&track!=="rtcdp"&&track!=="analytics"&&<span style={{color:P.amber,fontWeight:600}}> · {TRACK_LABELS[track]||"this track"} isn't indexed yet — results below are from RTCDP/Analytics only.</span>}
         </div>
         <div style={{display:"flex",gap:8}}>
           <input value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={handleKey}
@@ -7076,8 +7079,7 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
     {id:"assist",  label:"AI Tutor",          icon:Chat},
     {id:"capstone",   label:"Capstone",          icon:Ribbon,badge:isAboveGate?"ready":null},
     {id:"shadow",     label:"Practice Scenarios",icon:Target},
-    {id:"tracker",    label:"Weekly Tracker",    icon:Calendar},
-    {id:"projects",   label:"My Projects",       icon:Briefcase},
+    {id:"kb",         label:"Knowledge Base",    icon:Search},
     {id:"relnotes",   label:"Release Notes",      icon:FileText},
     {id:"community",  label:"Community",         icon:CommunityIcon},
     {id:"profile",    label:"Profile",           icon:User},
@@ -7119,8 +7121,7 @@ Return ONLY valid JSON: {"action":"short action title","reason":"1 sentence why"
           {id:"capstone",cat:"Capstone agent",label:"Capstone",meta:isAboveGate?"Unlocked":`${confPct}% confidence`,desc:"Prove readiness with a scenario-based final project.",color:P.blue},
         ];
         const otherCards=[
-          {id:"tracker",cat:"Delivery",label:"Weekly Tracker",meta:"Log your hours",desc:"Track your weekly bandwidth and commitments.",color:P.amber},
-          {id:"projects",cat:"Delivery",label:"My Projects",meta:`${(p.projects||[]).length} active`,desc:"Review your project assignments.",color:P.grn},
+          {id:"kb",cat:"Platform",label:"Knowledge Base",meta:"Search the docs",desc:"Search real AEP documentation, in-platform.",color:P.amber},
           {id:"relnotes",cat:"Platform",label:"Release Notes",meta:"What's new",desc:"See the latest Nexus + AEP platform updates.",color:P.grn},
           {id:"profile",cat:"Profile",label:"My Profile",meta:"Skills & certification",desc:"View your profile, skills, and certification status.",color:P.purple},
         ];
@@ -7746,7 +7747,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
     </div>
   );
 
-  const tabs=[{id:"home",label:"Home",icon:Home},{id:"track",label:"Learning Path",icon:Education},{id:"assist",label:"AI Tutor",icon:Chat},{id:"capstone",label:"Capstone",icon:Ribbon},{id:"shadow",label:"Practice Scenarios",icon:Target},{id:"relnotes",label:"Release Notes",icon:FileText},{id:"projects",label:"Projects",icon:Briefcase},{id:"tracker",label:"Weekly Tracker",icon:Calendar},{id:"community",label:"Community",icon:CommunityIcon},{id:"agent",label:"AI Advisor",icon:Chat},{id:"profile",label:"Profile",icon:User}];
+  const tabs=[{id:"home",label:"Home",icon:Home},{id:"track",label:"Learning Path",icon:Education},{id:"assist",label:"AI Tutor",icon:Chat},{id:"capstone",label:"Capstone",icon:Ribbon},{id:"shadow",label:"Practice Scenarios",icon:Target},{id:"kb",label:"Knowledge Base",icon:Search},{id:"relnotes",label:"Release Notes",icon:FileText},{id:"community",label:"Community",icon:CommunityIcon},{id:"agent",label:"AI Advisor",icon:Chat},{id:"profile",label:"Profile",icon:User}];
   const {mobile}=useViewport();
   // Real data only — the learner's own assessed level, not a fabricated
   // "market demand"/"team average" comparison (removed; there was no real
@@ -8006,8 +8007,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
         ];
         const otherCards=[
           {id:"profile",cat:"Skill growth",label:"My Skills",meta:`${criticalGaps.length} gaps to close`,desc:"Set your skill levels to ground AI Advisor recommendations.",color:P.purple},
-          {id:"projects",cat:"Delivery",label:"Projects",meta:`${(memberProjects[p.name]||[]).length} active · ${bw.used}h committed`,desc:"Review issues, sprint status, and visibility controls.",color:P.grn},
-          {id:"tracker",cat:"Delivery",label:"Weekly Tracker",meta:`${bw.avail}h free of ${bw.total}h`,desc:"Log hours and track your weekly bandwidth.",color:P.amber},
+          {id:"kb",cat:"Platform",label:"Knowledge Base",meta:"Search the docs",desc:"Search real AEP documentation, in-platform.",color:P.amber},
           {id:"relnotes",cat:"Platform",label:"Release Notes",meta:"What's new",desc:"See the latest Nexus + AEP platform updates.",color:P.grn},
         ];
         return(
@@ -8089,7 +8089,7 @@ function EXPDash({onLogout,groqKey,onLog,onJudge,githubToken,profile,memberProje
                 ))}
               </div>
           <SiteFooter setTab={setTab} mobile={mobile} cols={[
-            {h:"Learn",l:[{t:"Learning Path",tab:"track"},{t:"My Skills",tab:"profile"},{t:"Practice",tab:"shadow"},{t:"Projects",tab:"projects"}]},
+            {h:"Learn",l:[{t:"Learning Path",tab:"track"},{t:"My Skills",tab:"profile"},{t:"Practice",tab:"shadow"}]},
             {h:"Support",l:[{t:"Knowledge Base",tab:"kb"},{t:"AI Advisor",tab:"agent"},{t:"Community",tab:"community"}]},
             {h:"Adobe",l:[{t:"Experience League",href:"https://experienceleague.adobe.com"},{t:"Trust Center",href:"https://www.adobe.com/trust.html"},{t:"Privacy",href:"https://www.adobe.com/privacy/policy.html"},{t:"Terms",href:"https://www.adobe.com/legal/terms.html"}]},
           ]}/>

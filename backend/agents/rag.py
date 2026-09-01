@@ -626,7 +626,13 @@ def step_rerank(state: dict) -> dict:
         ({"doc": d, "s": scores[i] if i < len(scores) else 0} for i, d in enumerate(docs)),
         key=lambda x: x["s"], reverse=True,
     )
-    reranked = [x["doc"] for x in scored if x["s"] >= 3][:RAG_TOP_K]
+    # Threshold raised from >=3 to >=4: per RERANK_SYSTEM's own rubric, 2-3 is
+    # "related topic, indirect relevance" — letting those through was forcing
+    # weakly-related docs into the answer (e.g. a schema question citing
+    # "Computed Attributes" just because it's schema-adjacent) instead of
+    # honestly reporting "no relevant documentation found" when the index
+    # genuinely doesn't cover the topic.
+    reranked = [x["doc"] for x in scored if x["s"] >= 4][:RAG_TOP_K]
     return {**state, "reranked_docs": reranked}
 
 
@@ -671,8 +677,20 @@ def step_generate_answer(state: dict) -> dict:
 
 
 GUARD_SYSTEM = """You are a hallucination detector for AEP learning content.
-Given an answer and the source documents used to generate it, determine if the
-answer contains any claims NOT supported by the documents.
+Given an answer and the source documents used to generate it, determine whether
+the answer contains any FACTUAL claim that contradicts or is absent from the
+documents — a specific feature, number, product name, or behavior the docs
+never mention.
+
+Do NOT flag as ungrounded:
+- Reasonable summarization, rewording, or synthesis of what the documents say
+- Generic connective/explanatory sentences ("this is important because...",
+  "in summary...") that don't assert a new fact
+- A claim covered by combining multiple documents together, even if no single
+  document states the whole thing
+
+Only flag genuine invented facts — a specific claim the documents do not
+support and a knowledgeable AEP reader would flag as wrong or made up.
 
 Respond ONLY with valid JSON:
 {"grounded": true/false, "ungrounded_claims": ["..."], "confidence": 0.0-1.0}
@@ -684,7 +702,13 @@ def step_guard(state: dict) -> dict:
     docs = state.get("reranked_docs", [])
     if not docs or not answer:
         return {**state, "grounded": True, "guard_result": {}}
-    docs_text = " ".join(d["content"][:300] for d in docs)
+    # step_generate_answer gives the generator up to 500 chars per doc (see
+    # ctx build above) — the guard was only given 300, so it routinely flagged
+    # correct, fuller paraphrases as "unverifiable" simply because it never saw
+    # enough of the source text to check them against. Match the generator's
+    # budget so the guard judges against the same material the answer was
+    # actually written from.
+    docs_text = " ".join(d["content"][:500] for d in docs)
     try:
         raw = groq_call(
             [{"role": "user", "content": f"Answer:\n{answer}\n\nSource documents:\n{docs_text}"}],
